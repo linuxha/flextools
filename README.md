@@ -37,7 +37,11 @@ Fuzix-Compiler-Kit
 
 Used in testing with the Fuzix OS and C Compiler.
 
-## Tools
+# Notes
+
+As usual, this is a work in progress. There is a ton of debug code still sitting on much of this. The AI's math wasn't 'mathing'. Also this code isn't pretty. Not up to my usual standards but I trying to grasp what was wrong and fix the code. So far it's quite a few hacks to work around the AI's mess. I may refactor sometime in the future.
+
+# Tools
 
 |---------------|---------------------------------------------------|
 | file          | description                                       |
@@ -55,6 +59,7 @@ Used in testing with the Fuzix OS and C Compiler.
 | flexsort.c    | Clean up a flex disk directory                    |
 | flextract.c   | manipulate a flex disk                            |
 | flex_vfs      | Create and manipulate a flex disk (Perl)          |
+| flex_vfs.help | text file with basic help                         |
 |               |                                                   |
 |---------------|---------------------------------------------------|
 
