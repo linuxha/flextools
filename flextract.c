@@ -35,8 +35,8 @@ u_byte sector[SECTOR_SIZE];
  */
 #define SIR_SECTOR_PADDING 16
 typedef struct{
-    u_byte volLabel[11];
-    u_byte volNumberHi;
+    u_byte volLabel[11];        // 0 - 10
+    u_byte volNumberHi;         /* 11-12 */
     u_byte volNumberLo;
     u_byte firstFreeTrack;
     u_byte firstFreeSector;
@@ -86,6 +86,7 @@ bool program_exit(int rc){
  */
 bool calcDiskStructure(){
     int i, tr, se;
+
     // Check if file big enough to be a disk image
     if(dskFileSize < SECTOR_SIZE*10)
         return false;
@@ -96,8 +97,10 @@ bool calcDiskStructure(){
         if(dskFileData[i] > tr && dskFileData[i] - tr == 1)
             tr = dskFileData[i];
     }
+
     dskTracks = tr+1;
     dskSectors = dskFileSize/dskTracks/SECTOR_SIZE;
+
     if(dskTracks*dskSectors*SECTOR_SIZE == dskFileSize)
         return true;
 
@@ -112,6 +115,7 @@ bool calcDiskStructure(){
             se = 0;
         }
     }
+
     if(dskSectors){
         dskTracks = dskFileSize/dskSectors/SECTOR_SIZE;
         if(dskTracks*dskSectors*SECTOR_SIZE == dskFileSize)
@@ -119,8 +123,9 @@ bool calcDiskStructure(){
     }
 
     // Method 3 - Determine geometry based on SIR information
-    dskTracks  = dskFileData[SECTOR_SIZE*2 + SIR_SECTOR_PADDING + 22];
-    dskSectors = dskFileData[SECTOR_SIZE*2 + SIR_SECTOR_PADDING + 23];
+    dskTracks  = dskFileData[SECTOR_SIZE*2 + SIR_SECTOR_PADDING + 22]; // SIR[22]
+    dskSectors = dskFileData[SECTOR_SIZE*2 + SIR_SECTOR_PADDING + 23]; // SIR[23]
+
     if(dskTracks >= 34 && dskSectors >= 10)
         return true;
 
@@ -166,6 +171,7 @@ int getFileSize(FILE *fp){
 
     oPos = ftell(fp);
     fseek(fp,0,SEEK_END);
+
     fSize = ftell(fp);
     fseek(fp,oPos,SEEK_SET);
 
@@ -380,20 +386,24 @@ int main(int argc, char **argv){
 
     // Read image file
     dskFileSize = getFileSize(dskFile);
+
     if(flag_verbose)
         printf("Image size is %d bytes - ", dskFileSize);
     dskFileData = (u_byte*)malloc(dskFileSize);
+
     if(!dskFileData){
         printf("Unable to allocate memory\n");
         fclose(dskFile);
         program_exit(-2);
     }
+
     if(fread(dskFileData,1,dskFileSize,dskFile)!=(size_t)dskFileSize){
         free(dskFileData);
         printf("Unable to read file\n");
         fclose(dskFile);
         program_exit(-2);
     }
+
     fclose(dskFile);
 
     // Determine image file structure
@@ -431,7 +441,8 @@ int main(int argc, char **argv){
     file_t = 0; file_s = 0;
     if(flag_list)
         printf("NAME           START     END        SIZE    DATE       FLAG\n");
-    while(1){
+
+    while(1) {
         readSector(&sector,t,s);
         if(flag_debug){
             printf(" -- Track %d Sector %d --\n",t,s);
