@@ -7,68 +7,20 @@
 #include <time.h>
 #include <math.h>
 
-#define VERSION "1.0.2"
+#define VERSION "1.0.5"
 
-// --- Disk/Sector Constants ---
-#define SECTOR_SIZE         256
-#define SIR_SIZE            24
-#define SIR_OFFSET          16
-#define MAX_VOL_NAME_LEN    11
-#define DIR_ENTRY_SIZE      24
-
-#define DIR_ENTRIES_PER_SECTOR ( (SECTOR_SIZE - 16) / DIR_ENTRY_SIZE ) // (256 - 16) / 24 = 10 entries
-
-// --- FLEX Structures (Must match program logic) ---
-//typedef unsigned char uint8_t;
-
-// System Information Record (SIR) structure for reading parameters
-typedef struct {
-    uint8_t    volLabel[MAX_VOL_NAME_LEN]; 
-    uint8_t    volNumberHi;     
-    uint8_t    volNumberLo;     
-    uint8_t    firstFreeTrack;  
-    uint8_t    firstFreeSector; 
-    uint8_t    lastFreeTrack;   
-    uint8_t    lastFreeSector;  
-    uint8_t    freeSectorsHi;   
-    uint8_t    freeSectorsLo;   
-    uint8_t    dateMonth;       
-    uint8_t    dateDay;         
-    uint8_t    dateYear;        
-    uint8_t    endTrack;        
-    uint8_t    endSector;       
-} SIR_struct; // 24 bytes
-
-// Directory Entry structure
-typedef struct{
-    char      fileName[8];    // 8 byte --- File name
-    char      fileExt[3];     // 3 byte --- File extension
-#ifdef NJC
-    uint16_t  unused;         // 2 byte --- Not used         
-#else
-    u_byte unused1;
-    u_byte unused2;
-#endif
-    uint8_t   startTrack;     // 1 byte --- Start track
-    uint8_t   startSector;    // 1 byte --- Start sector
-    uint8_t   endTrack;       // 1 byte --- End track
-    uint8_t   endSector;      // 1 byte --- End sector
-    uint16_t  totalSectors;   // 2 byte --- Total number of sectors
-
-    uint8_t   randomFileFlag; // 1 byte --- Random file flag (0xFF is Sequential/Text)
-
-    uint8_t   unused3;        // 1 byte --- Not used
-
-    uint8_t   dateMonth;      // 1 byte --- Date month
-    uint8_t   dateDay;        // 1 byte --- Date day
-    uint8_t   dateYear;       // 1 byte --- Date year
-} DIR_struct; // 24 bytes total
+#include "flexfs.h"
 
 // --- Global Data/State ---
 uint8_t    SIR_buffer[SECTOR_SIZE];
-uint8_t    TRACK_COUNT;
-uint8_t    SECTORS_PER_TRACK;
-uint8_t    DIR_START_SECTOR = 5;
+uint16_t   track_count;
+uint8_t    sectors_per_track;
+uint8_t    dir_start_sector = 5;
+
+uint8_t    start_tracks;
+uint8_t    start_sectors;
+
+uint8_t    end_track, end_sector;
 
 // --- Utility Functions ---
 
@@ -79,8 +31,6 @@ uint8_t    DIR_START_SECTOR = 5;
  * @param flex_ext Output 3-byte buffer for the extension.
  */
 void convert_filename(const char *linux_filename, char *flex_name, char *flex_ext) {
-    //memset(flex_name, ' ', 8);
-    //memset(flex_ext, ' ', 3);
     memset(flex_name, 0x00, 8); // Don't fill with spaces
     memset(flex_ext, 0x00, 3);
 
@@ -117,7 +67,7 @@ void convert_filename(const char *linux_filename, char *flex_name, char *flex_ex
  * @return 0 on success, -1 on failure.
  */
 int read_sector(FILE *disk_file, uint8_t track, uint8_t sector, uint8_t *buffer) {
-    long offset = (long)track * SECTORS_PER_TRACK * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
+    long offset = (long)track * sectors_per_track * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
     if (fseek(disk_file, offset, SEEK_SET) != 0) {
         fprintf(stderr, "Error: Cannot seek to T%d S%d.\n", track, sector);
         return -1;
@@ -137,8 +87,8 @@ int read_sector(FILE *disk_file, uint8_t track, uint8_t sector, uint8_t *buffer)
  * @param buffer Buffer containing 256 bytes of data.
  * @return 0 on success, -1 on failure.
  */
-int write_sector(FILE *disk_file, uint8_t track, uint8_t sector, const uint8_t *buffer) {
-    long offset = (long)track * SECTORS_PER_TRACK * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
+int write_sector(FILE *disk_file, uint16_t track, uint8_t sector, const uint8_t *buffer) {
+    long offset = (long)track * sectors_per_track * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
     if (fseek(disk_file, offset, SEEK_SET) != 0) {
         fprintf(stderr, "Error: Cannot seek to write T%d S%d.\n", track, sector);
         return -1;
@@ -165,11 +115,13 @@ int init_disk_info(FILE *disk_file) {
     // Extract sectors per track (needed for addressing) and total tracks
     SIR_struct *sir = (SIR_struct *)(SIR_buffer + SIR_OFFSET);
     
-    TRACK_COUNT = sir->endTrack + 1;
-    SECTORS_PER_TRACK = sir->endSector;
+    track_count       = sir->endTrack + 1;
+    sectors_per_track = sir->endSector;
+    start_tracks      = sir->firstFreeTrack;
+    start_sectors     = sir->firstFreeSector;
 
-    if (SECTORS_PER_TRACK < 5 || TRACK_COUNT < 1) {
-        fprintf(stderr, "Error: Invalid disk parameters found in SIR.\n");
+    if (sectors_per_track < 5 || track_count < 1) {
+        fprintf(stderr, "Error: Invalid disk parameters found in SIR (T%d/S%d).\n", track_count, sectors_per_track);
         return -1;
     }
 
@@ -186,7 +138,13 @@ int init_disk_info(FILE *disk_file) {
 int find_free_sector(FILE *disk_file, uint8_t *track, uint8_t *sector) {
     SIR_struct *sir = (SIR_struct *)(SIR_buffer + SIR_OFFSET);
     
-    *track = sir->firstFreeTrack;
+    int i = 0;
+    for( i = 0; i < SIR_SIZE; i++) {
+        fprintf(stderr, "%02x ", SIR_buffer[i+SIR_OFFSET]);
+    }
+    fprintf(stderr, "\n");
+
+    *track  = sir->firstFreeTrack;
     *sector = sir->firstFreeSector;
     
     if (*track == 0 && *sector == 0) {
@@ -200,18 +158,18 @@ int find_free_sector(FILE *disk_file, uint8_t *track, uint8_t *sector) {
     }
     
     // The next free sector is stored in bytes 0 and 1
-    uint8_t next_track = sector_data[0];
+    uint8_t next_track  = sector_data[0];
     uint8_t next_sector = sector_data[1];
     
     // Update SIR with the new head of the free chain
-    sir->firstFreeTrack = next_track;
+    sir->firstFreeTrack  = next_track;
     sir->firstFreeSector = next_sector;
 
     // Decrement free sector count
-    uint16_t free_sectors = (sir->freeSectorsHi << 8) | sir->freeSectorsLo;
+    uint16_t free_sectors = (uint16_t)((sir->freeSectorsHi << 8) + (sir->freeSectorsLo));
     free_sectors--;
-    sir->freeSectorsHi = (free_sectors >> 8) & 0xFF;
-    sir->freeSectorsLo = free_sectors & 0xFF;
+    sir->freeSectorsHi = (uint8_t)((free_sectors >> 8) & 0xFF);
+    sir->freeSectorsLo = (uint8_t)(free_sectors & 0xFF);
     
     // Write the updated SIR back to the disk
     if (write_sector(disk_file, 0, 3, SIR_buffer) != 0) {
@@ -239,6 +197,8 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
     *sector_count = 0;
 
     uint8_t current_track, current_sector;
+    // Okay, this works by updating the previous sector's next_track, next_sector
+    // when the sector_count > 0
     uint8_t prev_track = 0, prev_sector = 0;
     
     // Buffer for the sector being written
@@ -253,8 +213,15 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
             return -1;
         }
 
+    fprintf(stderr, "Current: T%d/S%d\n", current_track, current_sector);
+
+    end_track  = current_track;
+    end_sector = current_sector;
+
+    fprintf(stderr, "Current: T%d/S%d\n", end_track, end_sector);
+
         if (*sector_count == 0) {
-            *start_track = current_track;
+            *start_track  = current_track;
             *start_sector = current_sector;
         }
 
@@ -264,7 +231,7 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
             uint8_t prev_sector_buffer[SECTOR_SIZE];
             if (read_sector(disk_file, prev_track, prev_sector, prev_sector_buffer) != 0) return -1;
             
-            prev_sector_buffer[0] = current_track; // Link Track
+            prev_sector_buffer[0] = current_track;  // Link Track
             prev_sector_buffer[1] = current_sector; // Link Sector
             
             // Write the updated previous sector back
@@ -282,7 +249,7 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
         memcpy(sector_buffer + 4, current_data, bytes_to_copy);
         
         // 4. Update state and write current sector
-        current_data += bytes_to_copy;
+        current_data    += bytes_to_copy;
         bytes_remaining -= bytes_to_copy;
         (*sector_count)++;
 
@@ -292,6 +259,7 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
             // LRN (bytes 2-3) remains 0 by default.
         } else {
             // Placeholder: Link field will be updated in the NEXT loop iteration
+            //
             sector_buffer[0] = 0;
             sector_buffer[1] = 0;
         }
@@ -300,13 +268,13 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
         if (write_sector(disk_file, current_track, current_sector, sector_buffer) != 0) return -1;
         
         // Update previous pointer for the next iteration
-        prev_track = current_track;
+        prev_track  = current_track;
         prev_sector = current_sector;
         
         // Break if we finished writing an empty file (sector_count will be 1)
         if (*sector_count > 0 && content_size == 0) break;
     }
-    
+
     return 0;
 }
 
@@ -317,14 +285,14 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
  * @return 0 on success, -1 on failure.
  */
 int write_directory_entry(FILE *disk_file, const DIR_struct *entry) {
-    uint8_t current_track = 0;
+    uint8_t current_track  = 0;
     uint8_t current_sector = DIR_START_SECTOR;
     uint8_t sector_buffer[SECTOR_SIZE];
     
     // Directory sectors start at T0, S5 and continue up to T0, S(sectors_per_track)
     // We assume the directory does not span multiple tracks for simplicity, as per flexdsk.c
 
-    while (current_sector <= SECTORS_PER_TRACK) {
+    while (current_sector <= sectors_per_track) {
         if (read_sector(disk_file, current_track, current_sector, sector_buffer) != 0) return -1;
 
         // Check 10 directory entries in this sector
@@ -473,12 +441,13 @@ int main(int argc, char *argv[]) {
     }
 
     // --- 5. Write Data and Update Directory ---
-    uint8_t  start_track, start_sector, end_track, end_sector;
+    //uint8_t  start_track, start_sector, end_track, end_sector;
+    uint8_t  start_track, start_sector;
     uint16_t total_sectors;
     
     // Write data to the file chain
     printf("Writing %ld bytes (%s) to disk...\n", final_size, translate_mode ? "translated text" : "binary");
-    
+
     // We pass the final_size (which might be 0 for an empty file)
     if (write_file_data(disk_file, raw_content, final_size, translate_mode, &start_track, &start_sector, &total_sectors) != 0) {
         // Rollback is skipped for this example
@@ -513,8 +482,8 @@ int main(int argc, char *argv[]) {
     
     // Since we don't track the last T/S allocated perfectly, we leave endT/S as 0/0 and rely on totalSectors.
     // The specification for endTrack/endSector is highly specific to FMS. We will rely on totalSectors.
-    end_track = 0; 
-    end_sector = 0;
+    //end_track  = 0; 
+    //end_sector = 0;
     
     if (total_sectors > 0) {
         printf("File data written: T%d S%d to T%d S%d, Total Sectors: %d\n", start_track, start_sector, end_track, end_sector, total_sectors);
@@ -534,15 +503,19 @@ int main(int argc, char *argv[]) {
     convert_filename(flex_name_ext, flex_name, flex_ext);
 
     memcpy(new_dir_entry.fileName, flex_name, 8);
-    memcpy(new_dir_entry.fileExt, flex_ext, 3);
+    memcpy(new_dir_entry.fileExt,  flex_ext,  3);
     
     // File attributes
-    new_dir_entry.unused         = 0;
+    //new_dir_entry.unused         = 0;
     new_dir_entry.startTrack     = start_track;
     new_dir_entry.startSector    = start_sector;
-    new_dir_entry.endTrack       = end_track; // Simplified
-    new_dir_entry.endSector      = end_sector; // Simplified
-    new_dir_entry.totalSectors   = total_sectors;
+
+    // @FIXME: Need to set these end_track/end_sector
+    new_dir_entry.endTrack       = end_track;   // Simplified
+    new_dir_entry.endSector      = end_sector;  // Simplified
+
+    new_dir_entry.totalSectorsHi = (uint8_t)((total_sectors >> 8) & 0xFF);
+    new_dir_entry.totalSectorsLo = (uint8_t)(total_sectors & 0xFF);
     new_dir_entry.randomFileFlag = translate_mode ? 0xFF : 0x00; // 0xFF for Text/Sequential
 
     // Date
@@ -556,9 +529,19 @@ int main(int argc, char *argv[]) {
     new_dir_entry.dateDay   = (uint8_t ) tm_info->tm_mday;
     new_dir_entry.dateYear  = (uint8_t )(tm_info->tm_year % 100);
 
-    fprintf(stderr, "%2d/%2d/%2d\n", (tm_info->tm_mon + 1), tm_info->tm_mday, (tm_info->tm_year % 100));
-    fprintf(stderr, "%2d/%2d/%2d (dec)\n", new_dir_entry.dateMonth, new_dir_entry.dateDay, new_dir_entry.dateYear);
-    fprintf(stderr, "%2x/%2x/%2x (hex)\n", new_dir_entry.dateMonth, new_dir_entry.dateDay, new_dir_entry.dateYear);
+    fprintf(stderr, "%s.%s\n", new_dir_entry.fileName, new_dir_entry.fileExt);
+    fprintf(stderr, "Start: T%d/S%d\n", new_dir_entry.startTrack, new_dir_entry.startSector);
+    fprintf(stderr, "End:   T%d/S%d\n", new_dir_entry.endTrack, new_dir_entry.endSector);
+    fprintf(stderr, "Size:  %02x%02x (%d)\n\n", new_dir_entry.totalSectorsHi,
+            new_dir_entry.totalSectorsLo,
+            ((new_dir_entry.totalSectorsHi << 8) + (new_dir_entry.totalSectorsLo)));
+
+    fprintf(stderr, "%2d/%2d/%2d\n", (tm_info->tm_mon + 1), tm_info->tm_mday,
+            (tm_info->tm_year % 100));
+    fprintf(stderr, "%2d/%2d/%2d (dec)\n", new_dir_entry.dateMonth, new_dir_entry.dateDay,
+            new_dir_entry.dateYear);
+    fprintf(stderr, "%2x/%2x/%2x (hex)\n", new_dir_entry.dateMonth, new_dir_entry.dateDay,
+            new_dir_entry.dateYear);
 
     // --- 7. Write Directory Entry ---
     if (write_directory_entry(disk_file, &new_dir_entry) != 0) {
