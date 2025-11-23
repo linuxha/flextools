@@ -9,70 +9,28 @@
 // --- Disk/Sector Constants ---
 typedef unsigned char u_byte;
 
-#define PROGRAM_VERSION     "1.1.4"
-#define SECTOR_SIZE         256
-#define SIR_SIZE            24
-#define SIR_OFFSET          16
-#define MAX_VOL_NAME_LEN    11
-#define DIR_ENTRY_SIZE      24
-#define DIR_ENTRIES_PER_SECTOR ((SECTOR_SIZE - 16) / DIR_ENTRY_SIZE) 
-#define DIR_START_SECTOR    5       // Directory structure starts at T0, S5
-#define DIR_START_TRACK     0       // Directory structure is always on T0
+// @FIXME: sorts okay but messes up the dir next_* links
+#define PROGRAM_VERSION     "1.1.6"
 
-// --- FLEX Structures ---
-
-// System Information Record (SIR) structure
-typedef struct {
-    u_byte volLabel[MAX_VOL_NAME_LEN]; 
-    u_byte volNumberHi;     
-    u_byte volNumberLo;     
-    u_byte firstFreeTrack;  
-    u_byte firstFreeSector; 
-    u_byte lastFreeTrack;   
-    u_byte lastFreeSector;  
-    u_byte freeSectorsHi;   
-    u_byte freeSectorsLo;   
-    u_byte dateMonth;       
-    u_byte dateDay;         
-    u_byte dateYear;        
-    u_byte endTrack;        
-    u_byte endSector;       
-} SIR_struct;
-
-// Directory Entry structure
-typedef struct{
-    char      fileName[8];    // 8 byte --- File name
-    char      fileExt[3];     // 3 byte --- File extension
-    uint16_t  unused;         // 2 byte --- Not used         
-    uint8_t   startTrack;     // 1 byte --- Start track
-    uint8_t   startSector;    // 1 byte --- Start sector
-    uint8_t   endTrack;       // 1 byte --- End track
-    uint8_t   endSector;      // 1 byte --- End sector
-    uint16_t  totalSectors;   // 2 byte --- Total number of sectors
-    uint8_t   randomFileFlag; // 1 byte --- Random file flag
-    uint8_t   unused3;        // 1 byte --- Not used
-    uint8_t   dateMonth;      // 1 byte --- Date month
-    uint8_t   dateDay;        // 1 byte --- Date day
-    uint8_t   dateYear;       // 1 byte --- Date year
-} DIR_struct;
+#include "flexfs.h"
 
 // --- Global Disk Info ---
-u_byte SIR_buffer[SECTOR_SIZE];
-u_byte TRACK_COUNT;
-u_byte SECTORS_PER_TRACK;
+uint8_t  SIR_buffer[SECTOR_SIZE];
+uint16_t track_count;
+uint8_t  sectors_per_track;
 
 // --- Utility Functions ---
 
 /**
  * @brief Reads a sector from the disk image.
  */
-int read_sector(FILE *disk_file, u_byte track, u_byte sector, u_byte *buffer) {
-    if (track >= TRACK_COUNT || sector > SECTORS_PER_TRACK || sector == 0) {
+int read_sector(FILE *disk_file, uint16_t track, uint8_t sector, uint8_t *buffer) {
+    if (track >= track_count || sector > sectors_per_track || sector == 0) {
         return -1;
     }
     
     // Offset calculation: (Track * SectorsPerTrack + (Sector - 1)) * SectorSize
-    long offset = (long)track * SECTORS_PER_TRACK * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
+    long offset = (long)track * sectors_per_track * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
     if (fseek(disk_file, offset, SEEK_SET) != 0) {
         return -1;
     }
@@ -85,12 +43,12 @@ int read_sector(FILE *disk_file, u_byte track, u_byte sector, u_byte *buffer) {
 /**
  * @brief Writes a sector to the disk image.
  */
-int write_sector(FILE *disk_file, u_byte track, u_byte sector, const u_byte *buffer) {
-    if (track >= TRACK_COUNT || sector > SECTORS_PER_TRACK || sector == 0) {
+int write_sector(FILE *disk_file, uint16_t track, uint8_t sector, const uint8_t *buffer) {
+    if (track >= track_count || sector > sectors_per_track || sector == 0) {
         return -1;
     }
 
-    long offset = (long)track * SECTORS_PER_TRACK * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
+    long offset = (long)track * sectors_per_track * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
     if (fseek(disk_file, offset, SEEK_SET) != 0) {
         return -1;
     }
@@ -104,8 +62,8 @@ int write_sector(FILE *disk_file, u_byte track, u_byte sector, const u_byte *buf
  * @brief Reads the SIR and sets global disk parameters.
  */
 int init_disk_info(FILE *disk_file) {
-    // We must read S3 to get SECTORS_PER_TRACK for later calculations.
-    u_byte temp_buffer[SECTOR_SIZE];
+    // We must read S3 to get sectors_per_track for later calculations.
+    uint8_t temp_buffer[SECTOR_SIZE];
     long sir_offset = (long)0 * 0 * SECTOR_SIZE + (long)(3 - 1) * SECTOR_SIZE; 
     
     if (fseek(disk_file, sir_offset, SEEK_SET) != 0) return -1;
@@ -115,11 +73,11 @@ int init_disk_info(FILE *disk_file) {
 
     SIR_struct *sir = (SIR_struct *)(SIR_buffer + SIR_OFFSET);
     
-    SECTORS_PER_TRACK = sir->endSector;
-    TRACK_COUNT = sir->endTrack + 1;
+    sectors_per_track = sir->endSector;
+    track_count = sir->endTrack + 1;
 
-    if (SECTORS_PER_TRACK < 5 || TRACK_COUNT < 1) {
-        fprintf(stderr, "Error: Invalid disk parameters found in SIR (S/T=%d, T/C=%d).\n", SECTORS_PER_TRACK, TRACK_COUNT);
+    if (sectors_per_track < 5 || track_count < 1) {
+        fprintf(stderr, "Error: Invalid disk parameters found in SIR (S/T=%d, T/C=%d).\n", sectors_per_track, track_count);
         return -1;
     }
 
@@ -155,10 +113,10 @@ int compare_dir_entries(const void *a, const void *b) {
  * @return Total count of active entries.
  */
 int read_directory(FILE *disk_file, DIR_struct **active_entries) {
-    u_byte current_track = DIR_START_TRACK;
-    u_byte current_sector = DIR_START_SECTOR;
+    uint8_t current_track = DIR_START_TRACK;
+    uint8_t current_sector = DIR_START_SECTOR;
     // Estimate max possible entries for initial allocation
-    int max_entries_possible = (SECTORS_PER_TRACK - (DIR_START_SECTOR - 1)) * DIR_ENTRIES_PER_SECTOR; 
+    int max_entries_possible = (sectors_per_track - (DIR_START_SECTOR - 1)) * DIR_ENTRIES_PER_SECTOR; 
     
     DIR_struct *entries = (DIR_struct *)malloc(max_entries_possible * sizeof(DIR_struct));
     if (!entries) {
@@ -167,7 +125,7 @@ int read_directory(FILE *disk_file, DIR_struct **active_entries) {
     }
 
     int active_count = 0;
-    u_byte sector_buffer[SECTOR_SIZE];
+    uint8_t sector_buffer[SECTOR_SIZE];
     
     // Iterate through the directory chain by following links (T0 S0 is end-of-chain)
     while (current_track != 0 || current_sector != 0) {
@@ -178,8 +136,8 @@ int read_directory(FILE *disk_file, DIR_struct **active_entries) {
         }
 
         // The link to the next sector is in bytes 0 and 1
-        u_byte next_track = sector_buffer[0];
-        u_byte next_sector = sector_buffer[1];
+        uint8_t next_track = sector_buffer[0];
+        uint8_t next_sector = sector_buffer[1];
 
         // Extract 10 directory entries from offset 16
         for (int i = 0; i < DIR_ENTRIES_PER_SECTOR; i++) {
@@ -218,10 +176,10 @@ cleanup:
  * @return 0 on success, -1 on failure.
  */
 int write_directory(FILE *disk_file, const DIR_struct *entries, int count) {
-    u_byte current_track = DIR_START_TRACK;
-    u_byte current_sector = DIR_START_SECTOR;
+    uint8_t current_track = DIR_START_TRACK;
+    uint8_t current_sector = DIR_START_SECTOR;
     int entry_index = 0;
-    u_byte sector_buffer[SECTOR_SIZE];
+    uint8_t sector_buffer[SECTOR_SIZE];
 
     // Read the link for the starting sector (T0, S5) once
     if (read_sector(disk_file, DIR_START_TRACK, DIR_START_SECTOR, sector_buffer) != 0) {
@@ -230,13 +188,13 @@ int write_directory(FILE *disk_file, const DIR_struct *entries, int count) {
     }
     
     // Initial next link read from T0, S5
-    u_byte next_track = sector_buffer[0];
-    u_byte next_sector = sector_buffer[1];
+    uint8_t next_track = sector_buffer[0];
+    uint8_t next_sector = sector_buffer[1];
 
     // Traverse the original chain and overwrite with new data
     while (current_track != 0 || current_sector != 0) {
-        u_byte sector_to_write_track = current_track;
-        u_byte sector_to_write_sector = current_sector;
+        uint8_t sector_to_write_track = current_track;
+        uint8_t sector_to_write_sector = current_sector;
         
         // 1. For sectors after the first one, we must read the link from the disk *before* writing over it.
         // We defer this read until the end of the previous loop iteration in the 'Move' step.
@@ -307,7 +265,7 @@ void display_results(const DIR_struct *entries, int count) {
     SIR_struct *sir = (SIR_struct *)(SIR_buffer + SIR_OFFSET);
     
     // --- Display SIR Info ---
-    long disk_size = (long)TRACK_COUNT * SECTORS_PER_TRACK * SECTOR_SIZE;
+    long disk_size = (long)track_count * sectors_per_track * SECTOR_SIZE;
     uint16_t free_sectors = (sir->freeSectorsHi << 8) | sir->freeSectorsLo;
 
     char vol_label[MAX_VOL_NAME_LEN + 1];
@@ -319,7 +277,7 @@ void display_results(const DIR_struct *entries, int count) {
     }
 
     printf("\nImage size is %ld bytes - %d tracks, %d sectors/track\n\n", 
-           disk_size, TRACK_COUNT, SECTORS_PER_TRACK);
+           disk_size, track_count, sectors_per_track);
     
     printf("Volume label      %-11s\n", vol_label);
     printf("Volume number     %04d\n", sir->volNumberLo);
@@ -351,7 +309,7 @@ void display_results(const DIR_struct *entries, int count) {
                full_name,
                entries[i].startTrack, entries[i].startSector,
                entries[i].endTrack, entries[i].endSector,
-               entries[i].totalSectors,
+               ((entries[i].totalSectorsHi >>8) + (entries[i].totalSectorsLo)),
                entries[i].dateMonth, entries[i].dateDay, entries[i].dateYear,
                entries[i].randomFileFlag);
     }
