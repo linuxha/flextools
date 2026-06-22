@@ -82,9 +82,11 @@ As usual, this is a work in progress. There is a ton of debug code still sitting
 
 Both flexadd and flexfs now support optional text translation.
 
-- Linux to FLEX: LF (0x0A) to CR (0x0D)
-- FLEX to Linux: CR (0x0D) to LF (0x0A)
-- TAB translate not supported yet
+- Linux to FLEX: LF (0x0A) to CR (0x0D), and space runs (2-127) to 0x09 + count
+- FLEX to Linux: CR (0x0D) to LF (0x0A), and 0x09 + count expanded back to spaces
+
+Note: the 0x09 byte is the FLEX text compression marker for space runs. It is
+not treated as a literal ASCII HT/TAB character in text mode.
 
 Examples:
 
