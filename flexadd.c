@@ -1,3 +1,60 @@
+/**
+ * flexadd - Add files from the host system to FLEX disk images
+ *
+ * Purpose:
+ *   flexadd adds or replaces files on FLEX disk images, supporting optional text
+ *   translation (LF to CR). It implements existing-file detection with interactive
+ *   confirmation and safe sector reclamation for deleted files.
+ *
+ * Directory Alignment (Critical):
+ *   FLEX directory sectors (T0,S5 onwards) have a 16-byte header (sector link and LRN),
+ *   followed by directory entries at 24-byte boundaries:
+ *   - Entry 0: bytes 16-39
+ *   - Entry 1: bytes 40-63
+ *   - Entry 2: bytes 64-87
+ *   etc.
+ *   Byte offset for entry i: 16 + (i * 24)
+ *
+ *   Note: Previous versions incorrectly iterated from i=1, placing first entry at byte 40.
+ *   This caused directory misalignment and file readability issues. Fixed to start at i=0.
+ *
+ * Sector Layout:
+ *   - Bytes 0-1: Next track/sector link (or 0,0 for last sector)
+ *   - Bytes 2-3: Logical record number (1-based, matches directory entry count)
+ *   - Bytes 4-255: Data payload (252 bytes)
+ *
+ * Author: Various (recent alignment fixes and existing-file handling)
+ * Version: 1.1.0 - Added 128/256 byte sector support and directory alignment fixes
+ */
+
+/**
+ * flexadd - Add files from the host system to FLEX disk images
+ *
+ * Purpose:
+ *   flexadd adds or replaces files on FLEX disk images, supporting optional text
+ *   translation (LF to CR). It implements existing-file detection with interactive
+ *   confirmation and safe sector reclamation for deleted files.
+ *
+ * Directory Alignment (Critical):
+ *   FLEX directory sectors (T0,S5 onwards) have a 16-byte header (sector link and LRN),
+ *   followed by 24-byte directory entries:
+ *   - Entry 0: bytes 16-39
+ *   - Entry 1: bytes 40-63
+ *   - Entry 2: bytes 64-87
+ *   Entry offset: 16 + (i * 24) where i is the 0-based slot index.
+ *
+ *   NOTE: Previous versions incorrectly started from i=1, placing the first entry at
+ *   byte 40 instead of byte 16. This caused directory misalignment and file readability
+ *   issues. Now fixed to start iteration at i=0.
+ *
+ * Sector Layout (Data Sectors):
+ *   - Bytes 0-1: Next track/sector link (0,0 indicates end of chain)
+ *   - Bytes 2-3: Logical record number (1-based counter: 1st, 2nd, 3rd sector, etc.)
+ *   - Bytes 4-255: Data payload (252 bytes)
+ *
+ * Version: 1.1.0 - Added 128/256 byte sector support and directory alignment fixes
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,12 +64,18 @@
 #include <time.h>
 #include <math.h>
 
-#define VERSION "1.0.5"
+#define VERSION "1.1.0" // Added support for 128/256 byte sectors and directory alignment
+
+// Sector size constants
+#define SECTOR_SIZE_128     128
+#define SECTOR_SIZE_256     256
+#define DEFAULT_SECTOR_SIZE 256
 
 #include "flexfs.h"
 
 // --- Global Data/State ---
-uint8_t    SIR_buffer[SECTOR_SIZE];
+int        sector_size = DEFAULT_SECTOR_SIZE;
+uint8_t   *SIR_buffer = NULL;
 uint16_t   track_count;
 uint8_t    sectors_per_track;
 uint8_t    dir_start_sector = 5;
@@ -63,16 +126,16 @@ void convert_filename(const char *linux_filename, char *flex_name, char *flex_ex
  * @param disk_file File pointer to the disk image.
  * @param track Track number (0-255).
  * @param sector Sector number (1-255).
- * @param buffer Buffer to store 256 bytes of data.
+ * @param buffer Buffer to store sector_size bytes of data.
  * @return 0 on success, -1 on failure.
  */
 int read_sector(FILE *disk_file, uint8_t track, uint8_t sector, uint8_t *buffer) {
-    long offset = (long)track * sectors_per_track * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
+    long offset = (long)track * sectors_per_track * sector_size + (long)(sector - 1) * sector_size;
     if (fseek(disk_file, offset, SEEK_SET) != 0) {
         fprintf(stderr, "Error: Cannot seek to T%d S%d.\n", track, sector);
         return -1;
     }
-    if (fread(buffer, 1, SECTOR_SIZE, disk_file) != SECTOR_SIZE) {
+    if (fread(buffer, 1, sector_size, disk_file) != sector_size) {
         fprintf(stderr, "Error: Cannot read T%d S%d.\n", track, sector);
         return -1;
     }
@@ -84,16 +147,16 @@ int read_sector(FILE *disk_file, uint8_t track, uint8_t sector, uint8_t *buffer)
  * @param disk_file File pointer to the disk image.
  * @param track Track number (0-255).
  * @param sector Sector number (1-255).
- * @param buffer Buffer containing 256 bytes of data.
+ * @param buffer Buffer containing sector_size bytes of data.
  * @return 0 on success, -1 on failure.
  */
 int write_sector(FILE *disk_file, uint16_t track, uint8_t sector, const uint8_t *buffer) {
-    long offset = (long)track * sectors_per_track * SECTOR_SIZE + (long)(sector - 1) * SECTOR_SIZE;
+    long offset = (long)track * sectors_per_track * sector_size + (long)(sector - 1) * sector_size;
     if (fseek(disk_file, offset, SEEK_SET) != 0) {
         fprintf(stderr, "Error: Cannot seek to write T%d S%d.\n", track, sector);
         return -1;
     }
-    if (fwrite(buffer, 1, SECTOR_SIZE, disk_file) != SECTOR_SIZE) {
+    if (fwrite(buffer, 1, sector_size, disk_file) != sector_size) {
         fprintf(stderr, "Error: Cannot write T%d S%d.\n", track, sector);
         return -1;
     }
@@ -106,6 +169,16 @@ int write_sector(FILE *disk_file, uint16_t track, uint8_t sector, const uint8_t 
  * @return 0 on success, -1 on failure.
  */
 int init_disk_info(FILE *disk_file) {
+    // Allocate SIR buffer based on sector size
+    if (SIR_buffer) {
+        free(SIR_buffer);
+    }
+    SIR_buffer = calloc(1, sector_size);
+    if (!SIR_buffer) {
+        fprintf(stderr, "Error: Failed to allocate SIR buffer.\n");
+        return -1;
+    }
+
     // Read SIR sector (Track 0, Sector 3)
     if (read_sector(disk_file, 0, 3, SIR_buffer) != 0) {
         fprintf(stderr, "Error: Failed to read SIR sector (T0 S3).\n");
@@ -152,8 +225,14 @@ int find_free_sector(FILE *disk_file, uint8_t *track, uint8_t *sector) {
     }
     
     // Read the current free sector to find the link to the next one
-    uint8_t sector_data[SECTOR_SIZE];
+    uint8_t *sector_data = calloc(1, sector_size);
+    if (!sector_data) {
+        fprintf(stderr, "Error: Failed to allocate sector buffer.\n");
+        return -1;
+    }
+    
     if (read_sector(disk_file, *track, *sector, sector_data) != 0) {
+        free(sector_data);
         return -1;
     }
     
@@ -174,9 +253,11 @@ int find_free_sector(FILE *disk_file, uint8_t *track, uint8_t *sector) {
     // Write the updated SIR back to the disk
     if (write_sector(disk_file, 0, 3, SIR_buffer) != 0) {
         fprintf(stderr, "Error: Failed to update SIR free chain info.\n");
+        free(sector_data);
         return -1;
     }
     
+    free(sector_data);
     return 0;
 }
 
@@ -202,7 +283,11 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
     uint8_t prev_track = 0, prev_sector = 0;
     
     // Buffer for the sector being written
-    uint8_t sector_buffer[SECTOR_SIZE] = {0};
+    uint8_t *sector_buffer = calloc(1, sector_size);
+    if (!sector_buffer) {
+        fprintf(stderr, "Error: Failed to allocate sector buffer.\n");
+        return -1;
+    }
 
     // Main loop: Write data sector by sector
     while (bytes_remaining > 0 || *sector_count == 0) {
@@ -228,27 +313,52 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
         // 2. Link the previous sector to this new sector
         if (*sector_count > 0) {
             // Read previous sector to update its link field (Bytes 0-1)
-            uint8_t prev_sector_buffer[SECTOR_SIZE];
-            if (read_sector(disk_file, prev_track, prev_sector, prev_sector_buffer) != 0) return -1;
+            uint8_t *prev_sector_buffer = calloc(1, sector_size);
+            if (!prev_sector_buffer) {
+                fprintf(stderr, "Error: Failed to allocate previous sector buffer.\n");
+                free(sector_buffer);
+                return -1;
+            }
+            
+            if (read_sector(disk_file, prev_track, prev_sector, prev_sector_buffer) != 0) {
+                free(prev_sector_buffer);
+                free(sector_buffer);
+                return -1;
+            }
             
             prev_sector_buffer[0] = current_track;  // Link Track
             prev_sector_buffer[1] = current_sector; // Link Sector
             
             // Write the updated previous sector back
-            if (write_sector(disk_file, prev_track, prev_sector, prev_sector_buffer) != 0) return -1;
+            if (write_sector(disk_file, prev_track, prev_sector, prev_sector_buffer) != 0) {
+                free(prev_sector_buffer);
+                free(sector_buffer);
+                return -1;
+            }
+            
+            free(prev_sector_buffer);
         }
 
         // 3. Prepare data for the current sector
-        memset(sector_buffer, 0, SECTOR_SIZE);
+        memset(sector_buffer, 0, sector_size);
         
-        // Bytes 0-3 are reserved for Link and LRN (zeroed initially)
-        long data_space = SECTOR_SIZE - 4;
+        // Bytes 0-1: Link (next track/sector), Bytes 2-3: Logical Record Number (LRN)
+        // These are zeroed initially; will be updated below.
+        long data_space = sector_size - 4;
         long bytes_to_copy = (bytes_remaining > data_space) ? data_space : bytes_remaining;
 
-        // Copy data into bytes 4-255
+        // Copy data into bytes 4 onwards (payload area)
         memcpy(sector_buffer + 4, current_data, bytes_to_copy);
         
-        // 4. Update state and write current sector
+        // 4. Set the logical record number (1-based) in bytes 2-3.
+        // This is the sector's position in the file chain (1st, 2nd, 3rd, etc.).
+        // FLEX extractors (flextract, flexfs) validate this field to detect truncated files.
+        // Must match the directory entry's sector count to pass integrity checks.
+        uint16_t logical_record = (uint16_t)(*sector_count + 1);
+        sector_buffer[2] = (logical_record >> 8) & 0xFF;  // High byte (big-endian)
+        sector_buffer[3] = logical_record & 0xFF;         // Low byte
+
+        // 5. Update state and write current sector
         current_data    += bytes_to_copy;
         bytes_remaining -= bytes_to_copy;
         (*sector_count)++;
@@ -265,7 +375,10 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
         }
 
         // Write the current sector
-        if (write_sector(disk_file, current_track, current_sector, sector_buffer) != 0) return -1;
+        if (write_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
+            free(sector_buffer);
+            return -1;
+        }
         
         // Update previous pointer for the next iteration
         prev_track  = current_track;
@@ -275,6 +388,237 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
         if (*sector_count > 0 && content_size == 0) break;
     }
 
+    free(sector_buffer);
+    return 0;
+}
+
+/**
+ * @brief Finds an existing directory entry by FLEX name/ext.
+ * 
+ * Scans directory sectors starting at T0,S5, checking each 24-byte entry slot.
+ * Directory entries begin at byte 16 (after 16-byte sector header), with each
+ * entry at offset: 16 + (i * 24) where i is the slot index (0-based).
+ * 
+ * Skips empty entries (first byte == 0x00) and deleted entries (first byte == 0xFF
+ * or high-bit set). Chains to next directory sector via link bytes (0-1) if needed.
+ * 
+ * @param found_sector Output: sector number (T0) where entry was found
+ * @param found_index Output: slot index (0-based) within that sector
+ * @param found_entry Output: copy of the 24-byte DIR_struct
+ * @return 1 if found, 0 if not found, -1 on error
+ */
+int find_directory_entry(FILE *disk_file, const char *flex_name, const char *flex_ext,
+        uint8_t *found_sector, int *found_index, DIR_struct *found_entry) {
+    uint8_t current_track  = 0;
+    uint8_t current_sector = DIR_START_SECTOR;
+    uint8_t *sector_buffer = calloc(1, sector_size);
+    if (!sector_buffer) {
+        fprintf(stderr, "Error: Failed to allocate sector buffer.\n");
+        return -1;
+    }
+
+    int dir_entries_per_sector = (sector_size - 16) / DIR_ENTRY_SIZE;
+
+    // Scan directory sectors, stopping at sector 0 (wrap-around guard)
+    while (current_sector <= sectors_per_track && current_sector != 0) {
+        if (read_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
+            free(sector_buffer);
+            return -1;
+        }
+
+        // Iterate through all directory entry slots in this sector (0-based)
+        for (int i = 0; i < dir_entries_per_sector; i++) {
+            size_t entry_offset = 16 + (i * DIR_ENTRY_SIZE);  // First entry at byte 16
+            DIR_struct *dir_ptr = (DIR_struct *)(sector_buffer + entry_offset);
+
+            if (dir_ptr->fileName[0] == 0x00 || (dir_ptr->fileName[0] & 0x80)) {
+                continue;
+            }
+
+            if (memcmp(dir_ptr->fileName, flex_name, 8) == 0 &&
+                memcmp(dir_ptr->fileExt, flex_ext, 3) == 0) {
+                if (found_sector) {
+                    *found_sector = current_sector;
+                }
+                if (found_index) {
+                    *found_index = i;
+                }
+                if (found_entry) {
+                    memcpy(found_entry, dir_ptr, DIR_ENTRY_SIZE);
+                }
+                free(sector_buffer);
+                return 1;
+            }
+        }
+
+        current_sector++;
+    }
+
+    free(sector_buffer);
+    return 0;
+}
+
+/**
+ * @brief Marks a directory entry as deleted (high-bit set on first filename char).
+ * @return 0 on success, -1 on failure.
+ */
+/**
+ * @brief Marks a directory entry as deleted by setting first byte to 0xFF.
+ * 
+ * Standard FLEX format: deleted entries have first byte of filename == 0xFF.
+ * This prevents directory walkers (flextract, flexfs) from displaying stale entries.
+ * 
+ * Entry is located at: offset 16 + (entry_index * 24) within the sector.
+ * 
+ * @param sector Directory sector number (typically T0,S5 or higher)
+ * @param entry_index Slot index (0-based) within that sector
+ * @return 0 on success, -1 on failure
+ */
+int delete_directory_entry(FILE *disk_file, uint8_t sector, int entry_index) {
+    uint8_t *sector_buffer = calloc(1, sector_size);
+    if (!sector_buffer) {
+        fprintf(stderr, "Error: Failed to allocate sector buffer.\n");
+        return -1;
+    }
+
+    if (read_sector(disk_file, 0, sector, sector_buffer) != 0) {
+        free(sector_buffer);
+        return -1;
+    }
+
+    // Calculate entry offset: first entry at byte 16, then 24-byte intervals
+    size_t entry_offset = 16 + (entry_index * DIR_ENTRY_SIZE);
+    DIR_struct *dir_ptr = (DIR_struct *)(sector_buffer + entry_offset);
+    // Mark deleted: set first byte to 0xFF (FLEX standard deleted marker)
+    ((uint8_t *)dir_ptr->fileName)[0] = 0xFF;
+
+    if (write_sector(disk_file, 0, sector, sector_buffer) != 0) {
+        free(sector_buffer);
+        return -1;
+    }
+
+    free(sector_buffer);
+    return 0;
+}
+
+/**
+ * @brief Normalizes legacy deleted markers (high-bit set first char) to 0xFF.
+ * @return 0 on success, -1 on failure.
+ */
+int normalize_deleted_directory_entries(FILE *disk_file) {
+    uint8_t current_track  = 0;
+    uint8_t current_sector = DIR_START_SECTOR;
+    uint8_t *sector_buffer = calloc(1, sector_size);
+    if (!sector_buffer) {
+        fprintf(stderr, "Error: Failed to allocate sector buffer.\n");
+        return -1;
+    }
+
+    int dir_entries_per_sector = (sector_size - 16) / DIR_ENTRY_SIZE;
+
+    while (current_sector <= sectors_per_track && current_sector != 0) {
+        int changed = 0;
+
+        if (read_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
+            free(sector_buffer);
+            return -1;
+        }
+
+        for (int i = 0; i < dir_entries_per_sector; i++) {
+            size_t entry_offset = 16 + (i * DIR_ENTRY_SIZE);
+            DIR_struct *dir_ptr = (DIR_struct *)(sector_buffer + entry_offset);
+            uint8_t first = ((uint8_t *)dir_ptr->fileName)[0];
+
+            if (first != 0xFF && (first & 0x80)) {
+                ((uint8_t *)dir_ptr->fileName)[0] = 0xFF;
+                changed = 1;
+            }
+        }
+
+        if (changed) {
+            if (write_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
+                free(sector_buffer);
+                return -1;
+            }
+        }
+
+        current_sector++;
+    }
+
+    free(sector_buffer);
+    return 0;
+}
+
+/**
+ * @brief Returns a deleted file's sector chain to the free list.
+ * @return 0 on success, -1 on failure.
+ */
+int reclaim_deleted_file_chain(FILE *disk_file, const DIR_struct *entry) {
+    uint16_t sector_total = (uint16_t)(((uint16_t)entry->totalSectorsHi << 8) | entry->totalSectorsLo);
+    if (sector_total == 0 || (entry->startTrack == 0 && entry->startSector == 0)) {
+        return 0;
+    }
+
+    SIR_struct *sir = (SIR_struct *)(SIR_buffer + SIR_OFFSET);
+    uint8_t *sector_buffer = calloc(1, sector_size);
+    if (!sector_buffer) {
+        fprintf(stderr, "Error: Failed to allocate sector buffer.\n");
+        return -1;
+    }
+
+    uint8_t current_track = entry->startTrack;
+    uint8_t current_sector = entry->startSector;
+    uint8_t last_track = 0;
+    uint8_t last_sector = 0;
+
+    for (uint16_t i = 0; i < sector_total; i++) {
+        if (current_track == 0 || current_sector == 0 || current_sector > sectors_per_track) {
+            fprintf(stderr, "Error: Invalid chain while reclaiming deleted file.\n");
+            free(sector_buffer);
+            return -1;
+        }
+
+        if (read_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
+            free(sector_buffer);
+            return -1;
+        }
+
+        last_track = current_track;
+        last_sector = current_sector;
+        current_track = sector_buffer[0];
+        current_sector = sector_buffer[1];
+    }
+
+    if (read_sector(disk_file, last_track, last_sector, sector_buffer) != 0) {
+        free(sector_buffer);
+        return -1;
+    }
+    sector_buffer[0] = sir->firstFreeTrack;
+    sector_buffer[1] = sir->firstFreeSector;
+    if (write_sector(disk_file, last_track, last_sector, sector_buffer) != 0) {
+        free(sector_buffer);
+        return -1;
+    }
+
+    if (sir->firstFreeTrack == 0 && sir->firstFreeSector == 0) {
+        sir->lastFreeTrack = last_track;
+        sir->lastFreeSector = last_sector;
+    }
+    sir->firstFreeTrack = entry->startTrack;
+    sir->firstFreeSector = entry->startSector;
+
+    uint16_t free_sectors = (uint16_t)(((uint16_t)sir->freeSectorsHi << 8) | sir->freeSectorsLo);
+    free_sectors += sector_total;
+    sir->freeSectorsHi = (uint8_t)((free_sectors >> 8) & 0xFF);
+    sir->freeSectorsLo = (uint8_t)(free_sectors & 0xFF);
+
+    if (write_sector(disk_file, 0, 3, SIR_buffer) != 0) {
+        fprintf(stderr, "Error: Failed to update SIR after delete.\n");
+        free(sector_buffer);
+        return -1;
+    }
+
+    free(sector_buffer);
     return 0;
 }
 
@@ -284,20 +628,40 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
  * @param entry The fully populated DIR_struct to write.
  * @return 0 on success, -1 on failure.
  */
+/**
+ * @brief Finds the first free directory entry slot and writes the new entry.
+ * 
+ * Scans directory sectors starting at T0,S5 for an unused slot (first byte == 0x00).
+ * Once found, writes the DIR_struct (24 bytes) at that offset and returns.
+ * 
+ * Directory entries are positioned at: offset 16 + (i * 24) for slot i (0-based).
+ * Continues to next sector if current sector is full, stops if reaches sector 0 (wrap).
+ * 
+ * @param entry Fully populated DIR_struct to write
+ * @return 0 on success, -1 on failure
+ */
 int write_directory_entry(FILE *disk_file, const DIR_struct *entry) {
     uint8_t current_track  = 0;
     uint8_t current_sector = DIR_START_SECTOR;
-    uint8_t sector_buffer[SECTOR_SIZE];
+    uint8_t *sector_buffer = calloc(1, sector_size);
+    if (!sector_buffer) {
+        fprintf(stderr, "Error: Failed to allocate sector buffer.\n");
+        return -1;
+    }
     
     // Directory sectors start at T0, S5 and continue up to T0, S(sectors_per_track)
     // We assume the directory does not span multiple tracks for simplicity, as per flexdsk.c
+    int dir_entries_per_sector = (sector_size - 16) / DIR_ENTRY_SIZE;
 
-    while (current_sector <= sectors_per_track) {
-        if (read_sector(disk_file, current_track, current_sector, sector_buffer) != 0) return -1;
+    while (current_sector <= sectors_per_track && current_sector != 0) {
+        if (read_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
+            free(sector_buffer);
+            return -1;
+        }
 
-        // Check 10 directory entries in this sector
-        for (int i = 0; i < DIR_ENTRIES_PER_SECTOR; i++) {
-            // Directory entries start at offset 16 (4-byte link/LRN + 12 unused)
+        // Scan for first free slot (first byte == 0x00). Slots start at index 0.
+        for (int i = 0; i < dir_entries_per_sector; i++) {
+            // Directory entries start at offset 16 (after 16-byte header), then 24-byte intervals
             size_t entry_offset = 16 + (i * DIR_ENTRY_SIZE);
             DIR_struct *dir_ptr = (DIR_struct *)(sector_buffer + entry_offset);
             
@@ -309,9 +673,11 @@ int write_directory_entry(FILE *disk_file, const DIR_struct *entry) {
                 // Write the updated directory sector back to disk
                 if (write_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
                     fprintf(stderr, "Error: Failed to write updated directory sector T%d S%d.\n", current_track, current_sector);
+                    free(sector_buffer);
                     return -1;
                 }
                 printf("Directory updated at T%d S%d, entry %d.\n", current_track, current_sector, i + 1);
+                free(sector_buffer);
                 return 0; // Success!
             }
         }
@@ -321,6 +687,7 @@ int write_directory_entry(FILE *disk_file, const DIR_struct *entry) {
     }
 
     fprintf(stderr, "Error: Directory is full. Cannot add file.\n");
+    free(sector_buffer);
     return -1;
 }
 
@@ -348,42 +715,36 @@ long translate_text_content(const uint8_t *content_in, long size_in, uint8_t *co
 // --- Main Function ---
 
 int main(int argc, char *argv[]) {
-    int is_translation_mode = 0;
-    
-    // Determine mode based on arguments
-    if (argc == 5 && strcmp(argv[2], "filename") == 0) {
-        // flexadd disk.dsk filename <FLEXFILE.EXT> -> Use argv[3] for host file, argv[4] for flex name
-        is_translation_mode = 1;
-    } else if (argc == 4) {
-        // flexadd disk.dsk Linux_filename FLEXFILE.EXT -> Use argv[2] for host file, argv[3] for flex name
-        // NO, the usage is slightly ambiguous. I'll stick to a standard positional argument for now
-        // and add the translation feature via a flag like -t later if required.
-        // For the provided examples:
-        // flexadd disk.dsk Linux_filename FLEXFILE.EXT
-        // flexadd disk.dsk filename <FLEXFILE.EXT> (Assuming this means translation)
-        
-        // I will interpret the primary usage as:
-        // flexadd <disk_image> <host_file> <flex_file.ext>
-        // and the second example as the same usage, where <FLEXFILE.EXT> is the FLEX name.
-        
-        // Reworking the arguments based on the simplest interpretation:
-        // disk_image = argv[1]
-        // host_file = argv[2]
-        // flex_filename = argv[3]
-        
-    } else {
-        // Use a clearer usage message for the command-line arguments.
-        fprintf(stderr, "Usage: flexadd <disk_image_file> <host_file_path> <FLEX_FILENAME.EXT> [-t]\n");
+    // Check for help or insufficient arguments
+    if (argc < 4) {
+        fprintf(stderr, "flexadd version %s\n", VERSION);
+        fprintf(stderr, "Usage: flexadd <disk_image_file> <host_file_path> <FLEX_FILENAME.EXT> [-t] [-z <sector_size>]\n");
         fprintf(stderr, "  -t: Enable text translation (LF to CR, tab compression not implemented).\n");
+        fprintf(stderr, "  -z <sector_size>: Sector size in bytes (128 or 256, defaults to 256).\n");
         return 1;
     }
 
-    // Set arguments based on assumed usage: flexadd <disk_image> <host_file> <flex_file.ext>
+    // Set arguments based on usage: flexadd <disk_image> <host_file> <flex_file.ext>
     const char *disk_path     = argv[1];
     const char *host_path     = argv[2];
     const char *flex_name_ext = argv[3];
 
-    int translate_mode = (argc > 4 && strcmp(argv[4], "-t") == 0);
+    int translate_mode = 0;
+    
+    // Parse optional arguments
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "-t") == 0) {
+            translate_mode = 1;
+        } else if (strcmp(argv[i], "-z") == 0 && i + 1 < argc) {
+            int temp_sector_size = atoi(argv[i + 1]);
+            if (temp_sector_size != SECTOR_SIZE_128 && temp_sector_size != SECTOR_SIZE_256) {
+                fprintf(stderr, "Error: Sector size (-z) must be either 128 or 256 bytes.\n");
+                return 1;
+            }
+            sector_size = temp_sector_size;
+            i++; // Skip the next argument since it's the sector size value
+        }
+    }
 
 
     // --- 1. Open Files ---
@@ -438,6 +799,55 @@ int main(int argc, char *argv[]) {
         free(raw_content);
         fclose(disk_file);
         return 1;
+    }
+
+    if (normalize_deleted_directory_entries(disk_file) != 0) {
+        free(raw_content);
+        fclose(disk_file);
+        return 1;
+    }
+
+    // Convert filename once so we can check if it already exists.
+    char flex_name[8], flex_ext[3];
+    convert_filename(flex_name_ext, flex_name, flex_ext);
+
+    // Existing name handling: require explicit confirmation before delete/re-add.
+    uint8_t existing_sector = 0;
+    int existing_index = 0;
+    DIR_struct existing_entry = {0};
+    int exists = find_directory_entry(disk_file, flex_name, flex_ext,
+                                      &existing_sector, &existing_index, &existing_entry);
+    if (exists < 0) {
+        free(raw_content);
+        fclose(disk_file);
+        return 1;
+    }
+    if (exists == 1) {
+        int answer = 0;
+        printf("File %.8s.%.3s exists. Delete and re-add? [y/N]: ", flex_name, flex_ext);
+        fflush(stdout);
+        answer = getchar();
+        while (answer != '\n' && getchar() != '\n') {
+            /* consume rest of line */
+        }
+
+        if (!(answer == 'y' || answer == 'Y')) {
+            fprintf(stderr, "Aborted: existing file was not replaced.\n");
+            free(raw_content);
+            fclose(disk_file);
+            return 1;
+        }
+
+        if (reclaim_deleted_file_chain(disk_file, &existing_entry) != 0) {
+            free(raw_content);
+            fclose(disk_file);
+            return 1;
+        }
+        if (delete_directory_entry(disk_file, existing_sector, existing_index) != 0) {
+            free(raw_content);
+            fclose(disk_file);
+            return 1;
+        }
     }
 
     // --- 5. Write Data and Update Directory ---
@@ -498,10 +908,6 @@ int main(int argc, char *argv[]) {
     // --- 6. Create Directory Entry ---
     DIR_struct new_dir_entry = {0};
     
-    // Filename and extension conversion
-    char flex_name[8], flex_ext[3];
-    convert_filename(flex_name_ext, flex_name, flex_ext);
-
     memcpy(new_dir_entry.fileName, flex_name, 8);
     memcpy(new_dir_entry.fileExt,  flex_ext,  3);
     
@@ -554,8 +960,11 @@ int main(int argc, char *argv[]) {
 
     // --- 8. Cleanup and Finalize ---
     free(raw_content);
+    if (SIR_buffer) {
+        free(SIR_buffer);
+    }
     fclose(disk_file);
-    printf("✅ Success! File '%s' added to disk image '%s'.\n", flex_name_ext, disk_path);
+    printf("✅ Success! File '%s' added to disk image '%s' (sector size: %d bytes).\n", flex_name_ext, disk_path, sector_size);
 
     return 0;
 }
