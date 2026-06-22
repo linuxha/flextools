@@ -23,7 +23,7 @@
  *   - Bytes 2-3: Logical record number (1-based counter matching sector position)
  *   - Bytes 4-255: Data payload (252 bytes)
  *
- * Version: Aligned with flexadd 1.1.0 directory structure
+ * Version: Aligned with flexadd 1.1.1 directory structure
  */
 
 #include <stdio.h>
@@ -36,7 +36,7 @@
 #include <assert.h>
 #include "flexfs.h"
 
-#define VERSION "1.1.0" // Added support for 128/256 byte sectors
+#define VERSION "1.1.1" // Added support for 128/256 byte sectors
 
 // Sector size constants
 #define SECTOR_SIZE_128     128
@@ -446,6 +446,7 @@ static struct dir *flex_create(const char *name, const char *ext)
     d->ssec = 0;
     d->etrack = 0;
     d->esec = 0;
+    d->rndf = 0;
     dir_write();
     return d;
 }
@@ -498,7 +499,7 @@ static int flex_append(struct dir *d, const char *buf)
     return 0;
 }
 
-static int flex_addfile(const char *name, const char *ext, FILE *inf)
+static int flex_addfile(const char *name, const char *ext, FILE *inf, int translate)
 {
     char *buf;
     int data_space = sector_size - 4;
@@ -518,6 +519,12 @@ static int flex_addfile(const char *name, const char *ext, FILE *inf)
     }
     
     while((l = fread(buf, 1, data_space, inf)) > 0) {
+        if (translate) {
+            for (int i = 0; i < l; i++) {
+                if ((uint8_t)buf[i] == 0x0A)
+                    buf[i] = 0x0D;
+            }
+        }
         /* Flex zeroes unused space and the Flex file formats need that */
         if (l != data_space)
             memset(buf + l, 0, data_space - l);
@@ -532,7 +539,7 @@ static int flex_addfile(const char *name, const char *ext, FILE *inf)
     return 0;
 }
 
-static int flex_dump(struct dir *d, FILE *outf, int ascii)
+static int flex_dump(struct dir *d, FILE *outf, int ascii, int translate)
 {
     int count = 0;
     int data_space = sector_size - 4;
@@ -548,7 +555,17 @@ static int flex_dump(struct dir *d, FILE *outf, int ascii)
                 d->name, d->ext, count, (workbuf[2] << 8) | workbuf[3]);
         if (ascii)
             decompress(workbuf + 4, data_space, outf);
-        else if (fwrite(workbuf + 4, data_space, 1, outf) != 1) {
+        else if (translate) {
+            for (int i = 0; i < data_space; i++) {
+                uint8_t c = workbuf[4 + i];
+                if (c == 0x0D)
+                    c = 0x0A;
+                if (fputc(c, outf) == EOF) {
+                    fprintf(stderr, "%s.%s: write error.\n", d->name, d->ext);
+                    exit(1);
+                }
+            }
+        } else if (fwrite(workbuf + 4, data_space, 1, outf) != 1) {
             fprintf(stderr, "%s.%s: write error.\n", d->name, d->ext);
             exit(1);
         }
@@ -556,17 +573,17 @@ static int flex_dump(struct dir *d, FILE *outf, int ascii)
     return 0;
 }
 
-static int flex_get(const char *name, const char *ext, FILE *outf, int ascii)
+static int flex_get(const char *name, const char *ext, FILE *outf, int ascii, int translate)
 {
     struct dir *d = dir_find(name, ext);
     if (d == NULL) {
         fprintf(stderr, "File not found.\n");
         return -1;
     }
-    return flex_dump(d, outf, ascii);
+    return flex_dump(d, outf, ascii, translate);
 }
 
-static void flex_get_all(void)
+static void flex_get_all(int translate)
 {
     FILE *outf;
     char buf[16];
@@ -583,7 +600,7 @@ static void flex_get_all(void)
             continue;
         }
         txt = !memcmp(d->ext, "TXT", 3);
-        flex_dump(d, outf, txt);
+        flex_dump(d, outf, txt, translate);
         fclose(outf);
     } while(dir_next());
 }
@@ -641,6 +658,7 @@ static void usage(void)
 {
     fprintf(stderr, "flexfs version %s\n", VERSION);
     fprintf(stderr, "-a: do space compressed to ASCII conversion.\n");
+    fprintf(stderr, "-t: text translation (get: CR->LF, put: LF->CR).\n");
     fprintf(stderr, "-d disk.dsk file.ext            : delete a file.\n");
     fprintf(stderr, "-g disk.dsk file.ext linuxfile  : get a file.\n");
     fprintf(stderr, "-g -A disk.dsk                  : extract all of the files.\n");
@@ -664,13 +682,14 @@ int main(int argc, char *argv[])
     int opt;
     int all = 0;
     int ascii = 0;
+    int translate = 0;
     enum command cmd = LIST;
     char *ext;
     char *name;
 
     assert(sizeof(struct dir) == 24);
     
-    while((opt = getopt(argc, argv, "lgmpdaAz:")) != -1) {
+    while((opt = getopt(argc, argv, "lgmpdaAtz:")) != -1) {
         switch(opt) {
         case 'l':
             cmd = LIST;
@@ -689,6 +708,9 @@ int main(int argc, char *argv[])
             break;
         case 'a':
             ascii = 1;
+            break;
+        case 't':
+            translate = 1;
             break;
         case 'A':
             all = 1;
@@ -742,14 +764,14 @@ int main(int argc, char *argv[])
             break;
         case GET:
             if (all)
-                flex_get_all();
+                flex_get_all(translate);
             else {
-                FILE *fp = fopen(argv[optind + 2], "w");
+                FILE *fp = fopen(argv[optind + 2], "wb");
                 if (fp == NULL) {
                     perror(argv[optind + 2]);
                     exit(1);
                 }
-                flex_get(name, ext, fp, ascii);
+                flex_get(name, ext, fp, ascii, translate);
                 if (fclose(fp) < 0) {
                     perror(argv[optind + 2]);
                     exit(1);
@@ -758,12 +780,12 @@ int main(int argc, char *argv[])
             break;
         case PUT:
             {
-                FILE *fp = fopen(argv[optind + 2], "r");
+                FILE *fp = fopen(argv[optind + 2], "rb");
                 if (fp == NULL) {
                     perror(argv[optind + 2]);
                     exit(1);
                 }
-                flex_addfile(name, ext, fp);
+                flex_addfile(name, ext, fp, translate);
                 if (fclose(fp) < 0) {
                     perror(argv[optind + 2]);
                     exit(1);
