@@ -1,3 +1,31 @@
+
+/**
+ * flexfs - FLEX disk image manipulation tool
+ *
+ * Purpose:
+ *   flexfs provides list, get, put, and delete operations on FLEX disk images.
+ *   Supports sector size detection (128 or 256 bytes), directory scanning, and
+ *   basic disk validation via block chain checking.
+ *
+ * Directory Alignment (Critical):
+ *   FLEX directory sectors (T0,S5 onwards) have a 16-byte header followed by
+ *   24-byte directory entries:
+ *   - Entry 0: bytes 16-39
+ *   - Entry 1: bytes 40-63
+ *   - Entry 2: bytes 64-87
+ *   Entry offset: 16 + (i * 24) where i is the 0-based slot index.
+ *   
+ *   This aligns with flexadd.c. Directory traversal (dir_begin, dir_get, dir_next)
+ *   now correctly starts iteration at slot 0 (not slot 1).
+ *
+ * Sector Layout (Data Sectors):
+ *   - Bytes 0-1: Next track/sector link (0,0 for chain end)
+ *   - Bytes 2-3: Logical record number (1-based counter matching sector position)
+ *   - Bytes 4-255: Data payload (252 bytes)
+ *
+ * Version: Aligned with flexadd 1.1.0 directory structure
+ */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -7,6 +35,16 @@
 #include <time.h>
 #include <assert.h>
 #include "flexfs.h"
+
+#define VERSION "1.1.0" // Added support for 128/256 byte sectors
+
+// Sector size constants
+#define SECTOR_SIZE_128     128
+#define SECTOR_SIZE_256     256
+#define DEFAULT_SECTOR_SIZE 256
+
+// Global sector size variable
+static int sector_size = DEFAULT_SECTOR_SIZE;
 
 /* FLEX stores text files in a slightly weird 'space compressed' format. This
    is the default automatic behaviour of FLEX and done by the OS itself so
@@ -60,7 +98,7 @@ static void decompress(uint8_t *buf, int len, FILE *fp)
 }
 
 /* Low level disk I/O */
-static struct sir sir;
+static struct Xsir sir;
 static int disk_fd;
 
 static void sir_setsecfree(uint16_t secs)
@@ -75,7 +113,7 @@ static off_t disk_offset(int track, int sec)
     if (track == 0 && sec < 2)
         sec++;
     pos += sec - 1;
-    pos *= 256;
+    pos *= sector_size;
     return pos;
 }
 
@@ -87,7 +125,7 @@ static void disk_read(int track, int sec, uint8_t *buf)
         perror("lseek");
         exit(1);
     }
-    if ((l = read(disk_fd, buf, 256)) != 256) {
+    if ((l = read(disk_fd, buf, sector_size)) != sector_size) {
         if (l < 0)
             perror("read");
         else
@@ -104,7 +142,7 @@ static void disk_write(int track, int sec, uint8_t *buf)
         perror("lseek");
         exit(1);
     }
-    if ((l = write(disk_fd, buf, 256)) != 256) {
+    if ((l = write(disk_fd, buf, sector_size)) != sector_size) {
         if (l < 0)
             perror("write");
         else
@@ -121,31 +159,74 @@ static int disk_read_next(uint8_t *buf)
     return 1;
 }
 
-static uint8_t workbuf[256];
-static uint8_t dirbuf[256];
+static uint8_t *workbuf = NULL;
+static uint8_t *dirbuf = NULL;
 static uint8_t dirtrk;
 static uint8_t dirsec;
 static int dirpt;
 static uint16_t *flex_map;
 
+static void allocate_buffers(void)
+{
+    if (workbuf) free(workbuf);
+    if (dirbuf) free(dirbuf);
+    
+    workbuf = calloc(1, sector_size);
+    dirbuf = calloc(1, sector_size);
+    
+    if (!workbuf || !dirbuf) {
+        fprintf(stderr, "Out of memory allocating sector buffers.\n");
+        exit(1);
+    }
+}
+
+static int dir_entries_per_sector = 10; // Will be calculated based on sector size
+
+/**
+ * @brief Initialize directory scanning.
+ * 
+ * Sets up directory iterator to start at T0,S5 (first directory sector),
+ * and initializes dirpt to 0 (first slot in sector, NOT slot 1).
+ * Calculates dir_entries_per_sector based on current sector size.
+ * 
+ * Directory entries are located at: offset 16 + (dirpt * 24)
+ * where dirpt is now 0-based (was 1-based in older versions).
+ */
 static void dir_begin(void)
 {
+    dir_entries_per_sector = (sector_size - 16) / 24;
     disk_read(0, 5, dirbuf);
     dirtrk = 0;
     dirsec = 5;
-    dirpt = 1;
+    dirpt = 0;  // Start at slot 0 (byte 16), not slot 1 (byte 40)
 }
 
+/**
+ * @brief Get current directory entry pointer.
+ * 
+ * Returns pointer to DIR_struct at current iterator position.
+ * Offset calculation: 16 + (dirpt * 24) ensures first entry at byte 16,
+ * with 24-byte intervals for subsequent entries.
+ */
 static struct dir *dir_get(void)
 {
-    return (struct dir *)(dirbuf + 24 * dirpt + 16);
+    return (struct dir *)(dirbuf + 24 * dirpt + 16);  // Start at byte 16 for dirpt=0
 }
 
+/**
+ * @brief Advance to next directory entry.
+ * 
+ * Increments dirpt and handles wrap-around to next directory sector.
+ * When dirpt >= entries_per_sector, resets to 0 and moves to next sector.
+ * Stops iteration when encountering sector 0 (wrap-around guard).
+ * 
+ * @return 1 if successful (more entries available), 0 if end of directory
+ */
 static int dir_next(void)
 {
     dirpt++;
-    if (dirpt == 10) {
-        dirpt = 1;
+    if (dirpt >= dir_entries_per_sector) {  // Move to next sector when full
+        dirpt = 0;  // Reset to first entry (slot 0) in next sector
         dirtrk = dirbuf[0];
         dirsec = dirbuf[1];
         return disk_read_next(dirbuf);
@@ -176,11 +257,26 @@ static struct dir *dir_find(const char *name, const char *ext)
     return NULL;
 }
 
+/**
+ * @brief Find first free directory entry slot.
+ * 
+ * Scans all directory entries looking for an unused slot marked by either:
+ * - First byte == 0x00 (empty, never used)
+ * - First byte with 0x80 bit set (0x80-0xFF range includes old high-bit markers
+ *   and the standard 0xFF deleted marker from flexadd)
+ * 
+ * Uses dir_begin() to start at T0,S5 and dir_next() to iterate through all
+ * entries across all directory sectors.
+ * 
+ * @return Pointer to first free DIR_struct entry, or NULL if directory is full
+ */
 static struct dir *dir_findfree(void)
 {
     dir_begin();
     do {
         struct dir *d = dir_get();
+        // Check for empty (0x00) or any deleted marker (0x80-0xFF range)
+        // This includes both old high-bit markers and standard 0xFF markers
         if (d->name[0] == 0 || d->name[0] & 0x80)
             return d;
     } while(dir_next());
@@ -198,16 +294,18 @@ static void timestamp(struct dir *d)
 
 static int read_sir(void)
 {
-    if (lseek(disk_fd, 512 + 16, SEEK_SET) < 0)
+    off_t sir_offset = (sector_size == SECTOR_SIZE_128) ? (2 * sector_size + 16) : (512 + 16);
+    if (lseek(disk_fd, sir_offset, SEEK_SET) < 0)
         return -1;
-    if (read(disk_fd, &sir, sizeof(struct sir)) != sizeof(struct sir))
+    if (read(disk_fd, &sir, sizeof(struct Xsir)) != sizeof(struct Xsir))
         return -1;
     return 0;
 }
 
 static void write_sir(void)
 {
-    if (lseek(disk_fd, 512 + 16, SEEK_SET) < 0 || write(disk_fd, &sir, sizeof(struct sir)) != sizeof(struct sir)) {
+    off_t sir_offset = (sector_size == SECTOR_SIZE_128) ? (2 * sector_size + 16) : (512 + 16);
+    if (lseek(disk_fd, sir_offset, SEEK_SET) < 0 || write(disk_fd, &sir, sizeof(struct Xsir)) != sizeof(struct Xsir)) {
         perror("write sir");
         exit(1);
     }
@@ -215,6 +313,7 @@ static void write_sir(void)
 
 static int flex_mount(void)
 {
+    allocate_buffers();
     if (read_sir() < 0)
         return -1;
 //    if (sir.month > 12 || sir.day > 31 || sir.day == 0)
@@ -224,8 +323,8 @@ static int flex_mount(void)
     printf("Mounting volume %-11.11s serial %d  %02d/%02d/%02d\n",
         sir.label, (sir.volh << 8) | sir.voll, 
         sir.day, sir.month, sir.year);
-    printf("Disk geometry is %d tracks, %d sectors per track.\n",
-        sir.endtrack + 1, sir.endsector);
+    printf("Disk geometry is %d tracks, %d sectors per track, %d bytes/sector.\n",
+        sir.endtrack + 1, sir.endsector, sector_size);
     return 0;
 }
 
@@ -351,10 +450,12 @@ static struct dir *flex_create(const char *name, const char *ext)
     return d;
 }
 
-/* Add a 256 byte sector to a file */
+/* Add a sector to a file */
 static int flex_append(struct dir *d, const char *buf)
 {
     uint8_t trk,sec;
+    int data_space = sector_size - 4;
+    
     /* Space ? */
     if (sir_secfree() == 0)
         return -1;
@@ -388,7 +489,7 @@ static int flex_append(struct dir *d, const char *buf)
     workbuf[2] = d->sech;
     workbuf[3] = d->secl;
     /* Add the data */
-    memcpy(workbuf + 4, buf, 252);
+    memcpy(workbuf + 4, buf, data_space);
     disk_write(trk, sec, workbuf);
     /* Adjust sir.secfree */
     sir_setsecfree(sir_secfree() - 1);
@@ -399,28 +500,42 @@ static int flex_append(struct dir *d, const char *buf)
 
 static int flex_addfile(const char *name, const char *ext, FILE *inf)
 {
-    char buf[252];
+    char *buf;
+    int data_space = sector_size - 4;
     int l;
     struct dir *d;
-    d = flex_create(name, ext);
-    if (d == NULL)
+    
+    buf = malloc(data_space);
+    if (!buf) {
+        fprintf(stderr, "Out of memory allocating file buffer.\n");
         return -1;
-    while((l = fread(buf, 1, 252, inf)) > 0) {
+    }
+    
+    d = flex_create(name, ext);
+    if (d == NULL) {
+        free(buf);
+        return -1;
+    }
+    
+    while((l = fread(buf, 1, data_space, inf)) > 0) {
         /* Flex zeroes unused space and the Flex file formats need that */
-        if (l != 252)
-            memset(buf + l, 0,252 - l);
+        if (l != data_space)
+            memset(buf + l, 0, data_space - l);
         flex_append(d, buf);
     }
     if (l == -1) {
         perror("read");
+        free(buf);
         exit(1);
     }
+    free(buf);
     return 0;
 }
 
 static int flex_dump(struct dir *d, FILE *outf, int ascii)
 {
     int count = 0;
+    int data_space = sector_size - 4;
     reset_decompress();
     /* Dump each sector in turn */
     if (d->strack == 0 && d->ssec == 0)
@@ -432,8 +547,8 @@ static int flex_dump(struct dir *d, FILE *outf, int ascii)
             fprintf(stderr, "%s.%s: sector %d has a sector count of %d.\n",
                 d->name, d->ext, count, (workbuf[2] << 8) | workbuf[3]);
         if (ascii)
-            decompress(workbuf + 4, 252, outf);
-        else if (fwrite(workbuf + 4, 252, 1, outf) != 1) {
+            decompress(workbuf + 4, data_space, outf);
+        else if (fwrite(workbuf + 4, data_space, 1, outf) != 1) {
             fprintf(stderr, "%s.%s: write error.\n", d->name, d->ext);
             exit(1);
         }
@@ -524,14 +639,15 @@ static void flex_showmap(void)
 
 static void usage(void)
 {
-    fprintf(stderr, "flexfs:\n");
+    fprintf(stderr, "flexfs version %s\n", VERSION);
     fprintf(stderr, "-a: do space compressed to ASCII conversion.\n");
     fprintf(stderr, "-d disk.dsk file.ext            : delete a file.\n");
     fprintf(stderr, "-g disk.dsk file.ext linuxfile  : get a file.\n");
     fprintf(stderr, "-g -A disk.dsk                  : extract all of the files.\n");
     fprintf(stderr, "-l disk.dsk                     : list contents of disk.\n");
     fprintf(stderr, "-m disk.dsk                     : check disk and show map.\n");
-    fprintf(stderr, "-p disk.dsik file.ext linuxfile : put a file.\n");
+    fprintf(stderr, "-p disk.disk file.ext linuxfile : put a file.\n");
+    fprintf(stderr, "-z <sector_size>                : sector size in bytes (128 or 256, defaults to 256).\n");
     exit(1);
 }
 
@@ -554,7 +670,7 @@ int main(int argc, char *argv[])
 
     assert(sizeof(struct dir) == 24);
     
-    while((opt = getopt(argc, argv, "lgmpdaA")) != -1) {
+    while((opt = getopt(argc, argv, "lgmpdaAz:")) != -1) {
         switch(opt) {
         case 'l':
             cmd = LIST;
@@ -576,6 +692,16 @@ int main(int argc, char *argv[])
             break;
         case 'A':
             all = 1;
+            break;
+        case 'z':
+            {
+                int temp_sector_size = atoi(optarg);
+                if (temp_sector_size != SECTOR_SIZE_128 && temp_sector_size != SECTOR_SIZE_256) {
+                    fprintf(stderr, "Error: Sector size (-z) must be either 128 or 256 bytes.\n");
+                    exit(1);
+                }
+                sector_size = temp_sector_size;
+            }
             break;
         default:
             usage();
@@ -650,5 +776,11 @@ int main(int argc, char *argv[])
         case MAP:
             flex_showmap();
     }
+    
+    // Cleanup allocated buffers
+    if (workbuf) free(workbuf);
+    if (dirbuf) free(dirbuf);
+    if (flex_map) free(flex_map);
+    
     return 0;
 }
