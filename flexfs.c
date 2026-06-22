@@ -1,4 +1,3 @@
-
 /**
  * flexfs - FLEX disk image manipulation tool
  *
@@ -23,7 +22,7 @@
  *   - Bytes 2-3: Logical record number (1-based counter matching sector position)
  *   - Bytes 4-255: Data payload (252 bytes)
  *
- * Version: Aligned with flexadd 1.1.1 directory structure
+ * Version: Aligned with flexadd 1.1.2 directory structure
  */
 
 #include <stdio.h>
@@ -36,7 +35,7 @@
 #include <assert.h>
 #include "flexfs.h"
 
-#define VERSION "1.1.1" // Added support for 128/256 byte sectors
+#define VERSION "1.1.2"
 
 // Sector size constants
 #define SECTOR_SIZE_128     128
@@ -520,10 +519,32 @@ static int flex_addfile(const char *name, const char *ext, FILE *inf, int transl
     
     while((l = fread(buf, 1, data_space, inf)) > 0) {
         if (translate) {
+            int out = 0;
             for (int i = 0; i < l; i++) {
-                if ((uint8_t)buf[i] == 0x0A)
-                    buf[i] = 0x0D;
+                uint8_t c = (uint8_t)buf[i];
+
+                if (c == '\r')
+                    continue;
+                if (c == '\n')
+                    c = 0x0D;
+
+                if (c == ' ') {
+                    int run = 1;
+                    while ((i + 1) < l && buf[i + 1] == ' ' && run < 127) {
+                        run++;
+                        i++;
+                    }
+                    if (run >= 2) {
+                        buf[out++] = 0x09;
+                        buf[out++] = (char)run;
+                    } else {
+                        buf[out++] = ' ';
+                    }
+                } else {
+                    buf[out++] = (char)c;
+                }
             }
+            l = out;
         }
         /* Flex zeroes unused space and the Flex file formats need that */
         if (l != data_space)
@@ -543,6 +564,7 @@ static int flex_dump(struct dir *d, FILE *outf, int ascii, int translate)
 {
     int count = 0;
     int data_space = sector_size - 4;
+    int pending_space_count = 0;
     reset_decompress();
     /* Dump each sector in turn */
     if (d->strack == 0 && d->ssec == 0)
@@ -558,6 +580,23 @@ static int flex_dump(struct dir *d, FILE *outf, int ascii, int translate)
         else if (translate) {
             for (int i = 0; i < data_space; i++) {
                 uint8_t c = workbuf[4 + i];
+
+                if (pending_space_count) {
+                    int count_spaces = c;
+                    while (count_spaces-- > 0) {
+                        if (fputc(' ', outf) == EOF) {
+                            fprintf(stderr, "%s.%s: write error.\n", d->name, d->ext);
+                            exit(1);
+                        }
+                    }
+                    pending_space_count = 0;
+                    continue;
+                }
+
+                if (c == 0x09) {
+                    pending_space_count = 1;
+                    continue;
+                }
                 if (c == 0x0D)
                     c = 0x0A;
                 if (fputc(c, outf) == EOF) {
@@ -658,7 +697,7 @@ static void usage(void)
 {
     fprintf(stderr, "flexfs version %s\n", VERSION);
     fprintf(stderr, "-a: do space compressed to ASCII conversion.\n");
-    fprintf(stderr, "-t: text translation (get: CR->LF, put: LF->CR).\n");
+    fprintf(stderr, "-t: text translation (get: CR->LF + 0x09 space expansion, put: LF->CR + 0x09 space compression).\n");
     fprintf(stderr, "-d disk.dsk file.ext            : delete a file.\n");
     fprintf(stderr, "-g disk.dsk file.ext linuxfile  : get a file.\n");
     fprintf(stderr, "-g -A disk.dsk                  : extract all of the files.\n");
