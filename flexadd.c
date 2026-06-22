@@ -8,35 +8,6 @@
  *
  * Directory Alignment (Critical):
  *   FLEX directory sectors (T0,S5 onwards) have a 16-byte header (sector link and LRN),
- *   followed by directory entries at 24-byte boundaries:
- *   - Entry 0: bytes 16-39
- *   - Entry 1: bytes 40-63
- *   - Entry 2: bytes 64-87
- *   etc.
- *   Byte offset for entry i: 16 + (i * 24)
- *
- *   Note: Previous versions incorrectly iterated from i=1, placing first entry at byte 40.
- *   This caused directory misalignment and file readability issues. Fixed to start at i=0.
- *
- * Sector Layout:
- *   - Bytes 0-1: Next track/sector link (or 0,0 for last sector)
- *   - Bytes 2-3: Logical record number (1-based, matches directory entry count)
- *   - Bytes 4-255: Data payload (252 bytes)
- *
- * Author: Various (recent alignment fixes and existing-file handling)
- * Version: 1.1.1 - Added 128/256 byte sector support and directory alignment fixes
- */
-
-/**
- * flexadd - Add files from the host system to FLEX disk images
- *
- * Purpose:
- *   flexadd adds or replaces files on FLEX disk images, supporting optional text
- *   translation (LF to CR). It implements existing-file detection with interactive
- *   confirmation and safe sector reclamation for deleted files.
- *
- * Directory Alignment (Critical):
- *   FLEX directory sectors (T0,S5 onwards) have a 16-byte header (sector link and LRN),
  *   followed by 24-byte directory entries:
  *   - Entry 0: bytes 16-39
  *   - Entry 1: bytes 40-63
@@ -52,7 +23,6 @@
  *   - Bytes 2-3: Logical record number (1-based counter: 1st, 2nd, 3rd sector, etc.)
  *   - Bytes 4-255: Data payload (252 bytes)
  *
- * Version: 1.1.1 - Added 128/256 byte sector support and directory alignment fixes
  */
 
 #include <stdio.h>
@@ -64,7 +34,7 @@
 #include <time.h>
 #include <math.h>
 
-#define VERSION "1.1.1" // Added support for 128/256 byte sectors and directory alignment
+#define VERSION "1.1.2"
 
 // Sector size constants
 #define SECTOR_SIZE_128     128
@@ -693,7 +663,8 @@ int write_directory_entry(FILE *disk_file, const DIR_struct *entry) {
 
 /**
  * @brief Translates Linux text file content to FLEX format.
- * Currently only replaces LF ($0A) with CR ($0D). Tab compression is not implemented.
+ * Replaces LF ($0A) with CR ($0D), drops CR ($0D), and applies FLEX
+ * space compression using 0x09 + count for space runs of length 2-127.
  * @param content_in Input buffer.
  * @param size_in Input size.
  * @param content_out Output buffer (must be large enough).
@@ -703,10 +674,31 @@ long translate_text_content(const uint8_t *content_in, long size_in, uint8_t *co
     long size_out = 0;
 
     for (long i = 0; i < size_in; i++) {
-        if (content_in[i] == '\n') { // Linux LF ($0A)
-            content_out[size_out++] = 0x0D; // FLEX CR ($0D)
-        } else if (content_in[i] != '\r') { // Ignore Windows/Mac CR ($0D) if present
-            content_out[size_out++] = content_in[i];
+        uint8_t c = content_in[i];
+
+        if (c == '\r') {
+            // Ignore Windows/Mac CR ($0D) if present in host file.
+            continue;
+        }
+        if (c == '\n') {
+            c = 0x0D; // FLEX newline is CR
+        }
+
+        if (c == ' ') {
+            int run = 1;
+            while ((i + 1) < size_in && content_in[i + 1] == ' ' && run < 127) {
+                run++;
+                i++;
+            }
+
+            if (run >= 2) {
+                content_out[size_out++] = 0x09;          // FLEX compression marker
+                content_out[size_out++] = (uint8_t)run;  // Space count (2-127)
+            } else {
+                content_out[size_out++] = ' ';
+            }
+        } else {
+            content_out[size_out++] = c;
         }
     }
     return size_out;
@@ -719,7 +711,7 @@ int main(int argc, char *argv[]) {
     if (argc < 4) {
         fprintf(stderr, "flexadd version %s\n", VERSION);
         fprintf(stderr, "Usage: flexadd <disk_image_file> <host_file_path> <FLEX_FILENAME.EXT> [-t] [-z <sector_size>]\n");
-        fprintf(stderr, "  -t: Enable text translation (LF to CR, tab compression not implemented).\n");
+        fprintf(stderr, "  -t: Enable text translation (LF->CR, space compression 0x09+count).\n");
         fprintf(stderr, "  -z <sector_size>: Sector size in bytes (128 or 256, defaults to 256).\n");
         return 1;
     }
