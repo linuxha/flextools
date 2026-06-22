@@ -24,7 +24,7 @@
  *   - Bytes 4-255: Data payload (252 bytes)
  *
  * Author: Various (recent alignment fixes and existing-file handling)
- * Version: 1.1.0 - Added 128/256 byte sector support and directory alignment fixes
+ * Version: 1.1.1 - Added 128/256 byte sector support and directory alignment fixes
  */
 
 /**
@@ -52,7 +52,7 @@
  *   - Bytes 2-3: Logical record number (1-based counter: 1st, 2nd, 3rd sector, etc.)
  *   - Bytes 4-255: Data payload (252 bytes)
  *
- * Version: 1.1.0 - Added 128/256 byte sector support and directory alignment fixes
+ * Version: 1.1.1 - Added 128/256 byte sector support and directory alignment fixes
  */
 
 #include <stdio.h>
@@ -64,7 +64,7 @@
 #include <time.h>
 #include <math.h>
 
-#define VERSION "1.1.0" // Added support for 128/256 byte sectors and directory alignment
+#define VERSION "1.1.1" // Added support for 128/256 byte sectors and directory alignment
 
 // Sector size constants
 #define SECTOR_SIZE_128     128
@@ -922,7 +922,8 @@ int main(int argc, char *argv[]) {
 
     new_dir_entry.totalSectorsHi = (uint8_t)((total_sectors >> 8) & 0xFF);
     new_dir_entry.totalSectorsLo = (uint8_t)(total_sectors & 0xFF);
-    new_dir_entry.randomFileFlag = translate_mode ? 0xFF : 0x00; // 0xFF for Text/Sequential
+    // Keep random flag cleared for all files.
+    new_dir_entry.randomFileFlag = 0x00;
 
     // Date
     time_t timer;
