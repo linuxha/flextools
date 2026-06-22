@@ -10,19 +10,23 @@
 typedef unsigned char uint8_t;
 #endif
 
-#define PROGRAM_VERSION     "1.0.15" // Version
+#define PROGRAM_VERSION     "1.1.0" // Version - Added support for 128/256 byte sectors
+
+// Sector size constants
+#define SECTOR_SIZE_128     128
+#define SECTOR_SIZE_256     256
+#define DEFAULT_SECTOR_SIZE 256
 
 extern void print_usage(const char *prog_name);
 extern void write_sector(FILE *disk_file, uint16_t track, uint8_t sector, uint8_t next_track,
-                         uint8_t next_sector);
+                         uint8_t next_sector, int sector_size);
 extern void write_sir_sector(FILE *disk_file, const char *vol_name, uint16_t tracks,
                              uint8_t sectors_per_track, uint16_t vol_number,
-                             const struct tm *current_time);
+                             const struct tm *current_time, int sector_size);
 
 #ifndef NJC
 #include "flexfs.h"
 #else
-#define SECTOR_SIZE         256
 #define SIR_SIZE            24      
 #define SIR_OFFSET          16      
 #define MAX_VOL_NAME_LEN    11      
@@ -56,20 +60,25 @@ typedef struct {
 // Function to display usage and version
 void print_usage(const char *prog_name) {
     fprintf(stderr, "flexdsk version %s\n", PROGRAM_VERSION);
-    fprintf(stderr, "Usage: %s <output_filename> -v <volume_name> -t <num_tracks> -s <num_sectors> [-n <volume_number>] [-b <boot_loader_file>]\n", prog_name);
+    fprintf(stderr, "Usage: %s <output_filename> -v <volume_name> -t <num_tracks> -s <num_sectors> [-n <volume_number>] [-b <boot_loader_file>] [-z <sector_size>]\n", prog_name);
     fprintf(stderr, "\nRequired Options:\n");
     fprintf(stderr, "  -v <volume_name> : The disk volume label (max %d characters).\n", MAX_VOL_NAME_LEN);
     fprintf(stderr, "  -t <num_tracks>  : Number of tracks (1-%d).\n", MAX_TRACKS);
     fprintf(stderr, "  -s <num_sectors> : Number of sectors per track (%d-%d).\n", MIN_SECTORS, MAX_SECTORS);
     fprintf(stderr, "\nOptional Options:\n");
     fprintf(stderr, "  -n <volume_number>: The disk volume number (1-255, defaults to %d).\n", DEFAULT_VOL_NUMBER);
-    fprintf(stderr, "  -b <boot_loader_file>: Path to a file to load into T0, S1 and S2 (512 bytes).\n");
+    fprintf(stderr, "  -b <boot_loader_file>: Path to a file to load into T0, S1 and S2 (boot sectors).\n");
+    fprintf(stderr, "  -z <sector_size>: Sector size in bytes (128 or 256, defaults to %d).\n", DEFAULT_SECTOR_SIZE);
 }
 
-// Function to write a single sector of 256 bytes
-void write_sector(FILE *disk_file, uint16_t track, uint8_t sector, uint8_t next_track, uint8_t next_sector)
+// Function to write a single sector with configurable size
+void write_sector(FILE *disk_file, uint16_t track, uint8_t sector, uint8_t next_track, uint8_t next_sector, int sector_size)
 {
-    uint8_t sector_data[SECTOR_SIZE] = {0};
+    uint8_t *sector_data = calloc(1, sector_size);
+    if (!sector_data) {
+        fprintf(stderr, "Error: Failed to allocate memory for sector data\n");
+        return;
+    }
 
     // Bytes 0-1 Link to the next sector (Req 1.2)
     // Exclude special sectors T0, S1, S2, S3, S4 (Req 1.1)
@@ -78,7 +87,8 @@ void write_sector(FILE *disk_file, uint16_t track, uint8_t sector, uint8_t next_
         sector_data[1] = next_sector;
     }
 
-    fwrite(sector_data, 1, SECTOR_SIZE, disk_file);
+    fwrite(sector_data, 1, sector_size, disk_file);
+    free(sector_data);
 }
 
 /*
@@ -93,8 +103,12 @@ void printVolumeLabel(uint8_t *s){
 }
 
 // Function to write the System Information Record (SIR) sector (T0, S3)
-void write_sir_sector(FILE *disk_file, const char *vol_name, uint16_t tracks, uint8_t sectors_per_track, uint16_t vol_number, const struct tm *current_time) {
-    uint8_t sir_sector_data[SECTOR_SIZE] = {0};
+void write_sir_sector(FILE *disk_file, const char *vol_name, uint16_t tracks, uint8_t sectors_per_track, uint16_t vol_number, const struct tm *current_time, int sector_size) {
+    uint8_t *sir_sector_data = calloc(1, sector_size);
+    if (!sir_sector_data) {
+        fprintf(stderr, "Error: Failed to allocate memory for SIR sector data\n");
+        return;
+    }
     
     // Calculate free sectors and start/end of free chain
     int total_sectors      = (int)tracks * (int)sectors_per_track;
@@ -149,7 +163,7 @@ void write_sir_sector(FILE *disk_file, const char *vol_name, uint16_t tracks, ui
     fprintf(stderr, "Free:    %d\n\n", free_sectors);
 
     fprintf(stderr, "%u tracks, %u sectors/track\n", sir_struct.endTrack, sir_struct.endSector);
-    fprintf(stderr, "Struct size      %02d-%02d\n", sizeof(sir_struct), SIR_SIZE);
+    fprintf(stderr, "Struct size      %02d-%02d\n", (int)sizeof(sir_struct), SIR_SIZE);
     fprintf(stderr, "\nVolume label     "); printVolumeLabel(sir_struct.volLabel); fprintf(stderr, "\n");
     fprintf(stderr, "Volume number    %02x%02x(%04x)\n",sir_struct.volNumberHi, sir_struct.volNumberLo, vol_number);
     fprintf(stderr, "Free area        t%u s%u - t%u s%u\n",
@@ -169,7 +183,8 @@ void write_sir_sector(FILE *disk_file, const char *vol_name, uint16_t tracks, ui
     }
     fprintf(stderr, "\n");
     
-    fwrite(sir_sector_data, 1, SECTOR_SIZE, disk_file);
+    fwrite(sir_sector_data, 1, sector_size, disk_file);
+    free(sir_sector_data);
 }
 
 // Main function
@@ -181,6 +196,7 @@ int main(int argc, char *argv[]) {
     uint16_t vol_number        = DEFAULT_VOL_NUMBER;
     char    *boot_loader_file = NULL;
     char    *output_filename  = NULL;
+    int     sector_size       = DEFAULT_SECTOR_SIZE;
     
     // Variables for getopt
     int opt;
@@ -197,7 +213,7 @@ int main(int argc, char *argv[]) {
     optind = 2; 
 
     // Parse command line options using getopt
-    while ((opt = getopt(argc, argv, "v:t:s:b:n:e:")) != -1) {
+    while ((opt = getopt(argc, argv, "v:t:s:b:n:e:z:")) != -1) {
         switch (opt) {
             case 'v':
                 vol_name_arg = optarg;
@@ -219,6 +235,16 @@ int main(int argc, char *argv[]) {
                         return 1;
                     }
                     vol_number = (uint16_t)temp_vol_num;
+                }
+                break;
+            case 'z':
+                {
+                    int temp_sector_size = atoi(optarg);
+                    if (temp_sector_size != SECTOR_SIZE_128 && temp_sector_size != SECTOR_SIZE_256) {
+                        fprintf(stderr, "Error: Sector size (-z) must be either 128 or 256 bytes.\n");
+                        return 1;
+                    }
+                    sector_size = temp_sector_size;
                 }
                 break;
             case '?':
@@ -277,41 +303,50 @@ int main(int argc, char *argv[]) {
     // T0, S1 & S2 (Boot Loader)
     if (boot_loader_file) {
         FILE *boot_file = fopen(boot_loader_file, "rb");
-        uint8_t boot_data[SECTOR_SIZE] = {0};
+        uint8_t *boot_data = calloc(1, sector_size);
+        if (!boot_data) {
+            fprintf(stderr, "Error: Failed to allocate memory for boot data\n");
+            return 1;
+        }
 
         if (boot_file) {
-            fread(boot_data, 1, SECTOR_SIZE, boot_file);
-            fwrite(boot_data, 1, SECTOR_SIZE, disk_file);
+            fread(boot_data, 1, sector_size, boot_file);
+            fwrite(boot_data, 1, sector_size, disk_file);
             
-            memset(boot_data, 0, SECTOR_SIZE);
-            fread(boot_data, 1, SECTOR_SIZE, boot_file);
-            fwrite(boot_data, 1, SECTOR_SIZE, disk_file);
+            memset(boot_data, 0, sector_size);
+            fread(boot_data, 1, sector_size, boot_file);
+            fwrite(boot_data, 1, sector_size, disk_file);
             
             fclose(boot_file);
         } else {
             fprintf(stderr, "Warning: Error opening boot loader file '%s'. Writing empty sectors for T0, S1 & S2.\n", boot_loader_file);
-            uint8_t empty_sector[SECTOR_SIZE] = {0};
-            fwrite(empty_sector, 1, SECTOR_SIZE, disk_file);
-            fwrite(empty_sector, 1, SECTOR_SIZE, disk_file);
+            fwrite(boot_data, 1, sector_size, disk_file);
+            fwrite(boot_data, 1, sector_size, disk_file);
         }
+        free(boot_data);
     } else {
-        uint8_t empty_sector[SECTOR_SIZE] = {0};
-        fwrite(empty_sector, 1, SECTOR_SIZE, disk_file); // T0, S1
-        fwrite(empty_sector, 1, SECTOR_SIZE, disk_file); // T0, S2
+        uint8_t *empty_sector = calloc(1, sector_size);
+        if (!empty_sector) {
+            fprintf(stderr, "Error: Failed to allocate memory for empty sector\n");
+            return 1;
+        }
+        fwrite(empty_sector, 1, sector_size, disk_file); // T0, S1
+        fwrite(empty_sector, 1, sector_size, disk_file); // T0, S2
+        free(empty_sector);
     }
     
     fprintf(stderr, "NTracks: %d\n", num_tracks);
 
     // T0, S3 (SIR)
     // Note: The maximum track number is (num_tracks - 1), which fits in a uint8_t (0-255).
-    write_sir_sector(disk_file, vol_name_arg, (uint16_t)num_tracks, (uint8_t)num_sectors, (uint16_t)vol_number, tm_info);
+    write_sir_sector(disk_file, vol_name_arg, (uint16_t)num_tracks, (uint8_t)num_sectors, (uint16_t)vol_number, tm_info, sector_size);
 
     // T0, S4 (Unused)
-    write_sector(disk_file, 0, 4, 0, 0); 
+    write_sector(disk_file, 0, 4, 0, 0, sector_size); 
     
     // T0, S5 up to T0, Sn (Directory - zeroed)
     for (int s = 5; s <= num_sectors; ++s) {
-        write_sector(disk_file, 0, (uint8_t)s, 0, s+1);
+        write_sector(disk_file, 0, (uint8_t)s, 0, s+1, sector_size);
     }
     
     // Remaining Free Chain Sectors (T1, S1 onwards)
@@ -333,7 +368,7 @@ int main(int argc, char *argv[]) {
                 next_sector = 0;
             }
             
-            write_sector(disk_file, (uint8_t)t, (uint8_t)s, next_track, next_sector);
+            write_sector(disk_file, (uint8_t)t, (uint8_t)s, next_track, next_sector, sector_size);
         }
     }
     
@@ -345,7 +380,7 @@ int main(int argc, char *argv[]) {
     printf("   Program Version: %s\n", PROGRAM_VERSION);
     printf("   File: %s\n", output_filename);
     printf("   Volume: %s (Number: %d)\n", vol_name_arg, vol_number);
-    printf("   Size: %d tracks (0-%d), %d sectors/track (Total %ld bytes)\n", num_tracks, num_tracks - 1, num_sectors, (long)num_tracks * num_sectors * SECTOR_SIZE);
+    printf("   Size: %d tracks (0-%d), %d sectors/track, %d bytes/sector (Total %ld bytes)\n", num_tracks, num_tracks - 1, num_sectors, sector_size, (long)num_tracks * num_sectors * sector_size);
     printf("   Creation Date: %02d/%02d/%d\n", tm_info->tm_mon + 1, tm_info->tm_mday, tm_info->tm_year % 100);
 
     return 0;
