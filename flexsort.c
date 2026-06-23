@@ -85,20 +85,33 @@ int init_disk_info(FILE *disk_file) {
 }
 
 /**
- * @brief Comparison function for qsort (for alphabetical sorting).
- * Ensures correct lexicographical comparison across the 8-byte name and 3-byte extension.
+ * @brief Returns non-zero if a directory entry is marked deleted.
+ */
+int is_deleted_entry(const DIR_struct *dir) {
+    uint8_t first = (uint8_t)dir->fileName[0];
+    return (first == 0xFF) || ((first & 0x80) != 0);
+}
+
+/**
+ * @brief Comparison function for qsort.
+ * Active entries are sorted alphabetically first, deleted entries are always last.
  */
 int compare_dir_entries(const void *a, const void *b) {
     const DIR_struct *dir_a = (const DIR_struct *)a;
     const DIR_struct *dir_b = (const DIR_struct *)b;
 
-    // 1. Compare the 8-byte Filename field.
+    int deleted_a = is_deleted_entry(dir_a);
+    int deleted_b = is_deleted_entry(dir_b);
+
+    if (deleted_a != deleted_b) {
+        return deleted_a - deleted_b;
+    }
+
     int name_cmp = strncmp(dir_a->fileName, dir_b->fileName, 8);
     if (name_cmp != 0) {
         return name_cmp;
     }
-    
-    // 2. If names are identical, compare the 3-byte Extension field.
+
     return strncmp(dir_a->fileExt, dir_b->fileExt, 3);
 }
 
@@ -109,10 +122,10 @@ int compare_dir_entries(const void *a, const void *b) {
  * @brief Reads all directory entries by following the sector linkage chain.
  * Traverses the directory chain using Bytes 0-1 of each sector.
  * @param disk_file File pointer.
- * @param active_entries Output array of active DIR_structs.
- * @return Total count of active entries.
+ * @param entries_out Output array of non-empty DIR_structs (active + deleted).
+ * @return Total count of non-empty entries.
  */
-int read_directory(FILE *disk_file, DIR_struct **active_entries) {
+int read_directory(FILE *disk_file, DIR_struct **entries_out) {
     uint8_t current_track = DIR_START_TRACK;
     uint8_t current_sector = DIR_START_SECTOR;
     // Estimate max possible entries for initial allocation
@@ -124,7 +137,7 @@ int read_directory(FILE *disk_file, DIR_struct **active_entries) {
         return -1;
     }
 
-    int active_count = 0;
+    int entry_count = 0;
     uint8_t sector_buffer[SECTOR_SIZE];
     
     // Iterate through the directory chain by following links (T0 S0 is end-of-chain)
@@ -144,11 +157,12 @@ int read_directory(FILE *disk_file, DIR_struct **active_entries) {
             size_t offset = 16 + (i * DIR_ENTRY_SIZE);
             DIR_struct *dir_ptr = (DIR_struct *)(sector_buffer + offset);
             
-            // Check file status: not unused (0x00) and not deleted (MSB set)
-            if (dir_ptr->fileName[0] != 0x00 && !(dir_ptr->fileName[0] & 0x80)) {
-                if (active_count < max_entries_possible) {
-                    memcpy(&entries[active_count], dir_ptr, DIR_ENTRY_SIZE);
-                    active_count++;
+            // Keep all non-empty entries (active + deleted). Deleted entries are
+            // sorted to the end later.
+            if ((uint8_t)dir_ptr->fileName[0] != 0x00) {
+                if (entry_count < max_entries_possible) {
+                    memcpy(&entries[entry_count], dir_ptr, DIR_ENTRY_SIZE);
+                    entry_count++;
                 } else {
                     fprintf(stderr, "Warning: Maximum directory capacity reached during read. Some files may be skipped.\n");
                     goto cleanup;
@@ -162,10 +176,10 @@ int read_directory(FILE *disk_file, DIR_struct **active_entries) {
     }
 
 cleanup:
-    // Shrink the memory block to the actual count of active entries
-    *active_entries = (DIR_struct *)realloc(entries, active_count * sizeof(DIR_struct));
+    // Shrink the memory block to the actual count of non-empty entries.
+    *entries_out = (DIR_struct *)realloc(entries, entry_count * sizeof(DIR_struct));
     
-    return active_count;
+    return entry_count;
 }
 
 /**
@@ -180,74 +194,39 @@ int write_directory(FILE *disk_file, const DIR_struct *entries, int count) {
     uint8_t current_sector = DIR_START_SECTOR;
     int entry_index = 0;
     uint8_t sector_buffer[SECTOR_SIZE];
+    uint8_t original_sector[SECTOR_SIZE];
 
-    // Read the link for the starting sector (T0, S5) once
-    if (read_sector(disk_file, DIR_START_TRACK, DIR_START_SECTOR, sector_buffer) != 0) {
-        fprintf(stderr, "Error: Could not read starting directory sector T%d S%d.\n", current_track, current_sector);
-        return -1;
-    }
-    
-    // Initial next link read from T0, S5
-    uint8_t next_track = sector_buffer[0];
-    uint8_t next_sector = sector_buffer[1];
-
-    // Traverse the original chain and overwrite with new data
+    // Traverse the original chain and rewrite every directory sector while
+    // preserving original next links in bytes 0-1.
     while (current_track != 0 || current_sector != 0) {
-        uint8_t sector_to_write_track = current_track;
-        uint8_t sector_to_write_sector = current_sector;
-        
-        // 1. For sectors after the first one, we must read the link from the disk *before* writing over it.
-        // We defer this read until the end of the previous loop iteration in the 'Move' step.
-        
-        // 2. Prepare the new sector buffer: zero everything
-        // This ensures unused entries are marked 0x00
-        memset(sector_buffer, 0, SECTOR_SIZE);
-
-        // 3. Populate directory entries
-        for (int i = 0; i < DIR_ENTRIES_PER_SECTOR; i++) {
-            size_t offset = 16 + (i * DIR_ENTRY_SIZE);
-            if (entry_index < count) {
-                // Copy active entry
-                memcpy(sector_buffer + offset, &entries[entry_index], DIR_ENTRY_SIZE);
-                entry_index++;
-            } else {
-                // All active files have been written. Stop populating.
-                break; 
-            }
-        }
-        
-        // 4. Write the link back to the buffer (Bytes 0-1)
-        if (entry_index < count) {
-             // If there are still entries to write, the link should point to the next sector in the original chain
-             sector_buffer[0] = next_track; 
-             sector_buffer[1] = next_sector;
-        } else {
-             // If all entries are written, the directory chain ends here.
-             sector_buffer[0] = 0; 
-             sector_buffer[1] = 0;
-             next_track = 0; // Ensures the loop terminates after this write
-             next_sector = 0;
-        }
-        
-        // 5. Write the repacked sector back
-        if (write_sector(disk_file, sector_to_write_track, sector_to_write_sector, sector_buffer) != 0) {
-            fprintf(stderr, "Error: Failed to write repacked directory sector T%d S%d.\n", sector_to_write_track, sector_to_write_sector);
+        if (read_sector(disk_file, current_track, current_sector, original_sector) != 0) {
+            fprintf(stderr, "Error: Could not read original directory sector T%d S%d.\n", current_track, current_sector);
             return -1;
         }
 
-        // 6. Move to the next sector in the chain
+        uint8_t next_track = original_sector[0];
+        uint8_t next_sector = original_sector[1];
+
+        memset(sector_buffer, 0, SECTOR_SIZE);
+        sector_buffer[0] = next_track;
+        sector_buffer[1] = next_sector;
+
+        // Populate directory entries for this sector, remaining slots are 0x00.
+        for (int i = 0; i < DIR_ENTRIES_PER_SECTOR; i++) {
+            size_t offset = 16 + (i * DIR_ENTRY_SIZE);
+            if (entry_index < count) {
+                memcpy(sector_buffer + offset, &entries[entry_index], DIR_ENTRY_SIZE);
+                entry_index++;
+            }
+        }
+
+        if (write_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
+            fprintf(stderr, "Error: Failed to write repacked directory sector T%d S%d.\n", current_track, current_sector);
+            return -1;
+        }
+
         current_track = next_track;
         current_sector = next_sector;
-        
-        // 7. If we are moving to the next sector (and not exiting), read its link for the *next* iteration
-        if (current_track != 0 || current_sector != 0) {
-            if (read_sector(disk_file, current_track, current_sector, sector_buffer) != 0) {
-                fprintf(stderr, "Error: Could not read original directory sector T%d S%d to find next link.\n", current_track, current_sector);
-                return -1;
-            }
-            next_track = sector_buffer[0];
-            next_sector = sector_buffer[1];
-        }
     }
 
     if (entry_index < count) {
@@ -320,7 +299,7 @@ void display_results(const DIR_struct *entries, int count) {
 void print_usage(const char *prog_name) {
     fprintf(stderr, "flexsort version %s\n", PROGRAM_VERSION);
     fprintf(stderr, "Usage: %s <disk_image_file> [-a]\n", prog_name);
-    fprintf(stderr, "  -a: Sort all active directory entries alphabetically by filename/extension.\n");
+    fprintf(stderr, "  -a: Sort all non-empty directory entries alphabetically; deleted entries are placed last.\n");
 }
 
 // --- Main Function ---
@@ -354,38 +333,46 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // --- 3. Read and Filter Directory Entries ---
-    DIR_struct *active_entries = NULL;
-    int active_count = read_directory(disk_file, &active_entries);
+    // --- 3. Read non-empty directory entries (active + deleted) ---
+    DIR_struct *entries = NULL;
+    int entry_count = read_directory(disk_file, &entries);
 
-    if (active_count < 0) {
+    if (entry_count < 0) {
         // Error handling for allocation failure in read_directory
         fclose(disk_file);
         return 1;
     }
-    
-    printf("Read %d active file entries.\n", active_count);
+
+    int deleted_count = 0;
+    for (int i = 0; i < entry_count; i++) {
+        if (is_deleted_entry(&entries[i])) {
+            deleted_count++;
+        }
+    }
+
+    printf("Read %d non-empty directory entries (%d active, %d deleted).\n",
+           entry_count, entry_count - deleted_count, deleted_count);
 
     // --- 4. Sort Entries (if requested) ---
-    if (sort_flag && active_count > 1) {
-        qsort(active_entries, active_count, sizeof(DIR_struct), compare_dir_entries);
-        printf("Directory entries sorted alphabetically.\n");
+    if (sort_flag && entry_count > 1) {
+        qsort(entries, entry_count, sizeof(DIR_struct), compare_dir_entries);
+        printf("Directory entries sorted alphabetically (deleted entries last).\n");
     }
 
     // --- 5. Repack and Write Directory ---
-    if (write_directory(disk_file, active_entries, active_count) != 0) {
+    if (write_directory(disk_file, entries, entry_count) != 0) {
         fprintf(stderr, "Error: Failed to write repacked directory.\n");
-        free(active_entries);
+        free(entries);
         fclose(disk_file);
         return 1;
     }
     printf("Directory successfully repacked and written back to '%s'.\n", disk_path);
 
     // --- 6. Display Results ---
-    display_results(active_entries, active_count);
+    display_results(entries, entry_count);
 
     // --- 7. Cleanup ---
-    free(active_entries);
+    free(entries);
     fclose(disk_file);
 
     return 0;
