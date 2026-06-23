@@ -3296,8 +3296,8 @@ sub name_match_dir {
 sub rm_dir_entry {
     my ($drive, $index) = @_;
 
-    my $trk = $dsk[$drive]->{dir}->[$index]->{T};
-    my $sct = $dsk[$drive]->{dir}->[$index]->{S};
+    my $trk   = $dsk[$drive]->{dir}->[$index]->{T};
+    my $sct   = $dsk[$drive]->{dir}->[$index]->{S};
     my $entry = $dsk[$drive]->{dir}->[$index]->{ENTRY};
 
     # first byte of the directory entry (first byte of the name)
