@@ -19,6 +19,9 @@ Linux tools for working with the TSC's Flex disk images and vintage computers su
 
 # Delete a FLEX file
 ./flexfs -d [-z 128|256] <disk.dsk> <FILE.EXT>
+
+# Convert Motorola S-record to FLEX CMD
+./s192cmd <input.s19> <output.cmd>
 ```
 
 Currently the 128 byte sectors are not ready for use. That's a project in progress. TSC's MiniFlex uses 128 byte sectors. I do plan to properly support those files images also.
@@ -118,6 +121,7 @@ Sector size override is available on both tools with -z 128 or -z 256.
 | flexfs.c      | manipulate virtual flex disks                     |
 | flexsort.c    | Clean up a flex disk directory                    |
 | flextract.c   | manipulate a flex disk                            |
+| s192cmd.c     | convert Motorola S-record files to FLEX CMD      |
 | flex_vfs      | Create and manipulate a flex disk (Perl)          |
 | flex_vfs.help | text file with basic help                         |
 
