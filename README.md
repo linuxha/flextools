@@ -109,6 +109,7 @@ Sector size override is available on both tools with -z 128 or -z 256.
 # Tools
 
 | file          | description                                       |
+|---------------|---------------------------------------------------|
 | cmd2bin.c     | converts a cmd file to binary                     |
 | fddump.c      | a hex dump like program for Flex disks - old name |
 | flexdump.c    | a hex dump like program for Flex disks - new name |
@@ -121,7 +122,7 @@ Sector size override is available on both tools with -z 128 or -z 256.
 | flexfs.c      | manipulate virtual flex disks                     |
 | flexsort.c    | Clean up a flex disk directory                    |
 | flextract.c   | manipulate a flex disk                            |
-| s192cmd.c     | convert Motorola S-record files to FLEX CMD      |
+| s192cmd.c     | convert Motorola S-record files to FLEX CMD       |
 | flex_vfs      | Create and manipulate a flex disk (Perl)          |
 | flex_vfs.help | text file with basic help                         |
 
