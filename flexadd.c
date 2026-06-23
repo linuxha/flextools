@@ -710,8 +710,9 @@ int main(int argc, char *argv[]) {
     // Check for help or insufficient arguments
     if (argc < 4) {
         fprintf(stderr, "flexadd version %s\n", VERSION);
-        fprintf(stderr, "Usage: flexadd <disk_image_file> <host_file_path> <FLEX_FILENAME.EXT> [-t] [-z <sector_size>]\n");
+        fprintf(stderr, "Usage: flexadd <disk_image_file> <host_file_path> <FLEX_FILENAME.EXT> [-t] [-y] [-z <sector_size>]\n");
         fprintf(stderr, "  -t: Enable text translation (LF->CR, space compression 0x09+count).\n");
+        fprintf(stderr, "  -y: Auto-replace existing file without confirmation prompt.\n");
         fprintf(stderr, "  -z <sector_size>: Sector size in bytes (128 or 256, defaults to 256).\n");
         return 1;
     }
@@ -722,11 +723,14 @@ int main(int argc, char *argv[]) {
     const char *flex_name_ext = argv[3];
 
     int translate_mode = 0;
+    int auto_yes = 0;
     
     // Parse optional arguments
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0) {
             translate_mode = 1;
+        } else if (strcmp(argv[i], "-y") == 0) {
+            auto_yes = 1;
         } else if (strcmp(argv[i], "-z") == 0 && i + 1 < argc) {
             int temp_sector_size = atoi(argv[i + 1]);
             if (temp_sector_size != SECTOR_SIZE_128 && temp_sector_size != SECTOR_SIZE_256) {
@@ -815,19 +819,23 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (exists == 1) {
-        int answer = 0;
-        printf("File %.8s.%.3s exists. Delete and re-add? [y/N]: ", flex_name, flex_ext);
-        fflush(stdout);
-        answer = getchar();
-        while (answer != '\n' && getchar() != '\n') {
-            /* consume rest of line */
-        }
+        if (!auto_yes) {
+            int answer = 0;
+            printf("File %.8s.%.3s exists. Delete and re-add? [y/N]: ", flex_name, flex_ext);
+            fflush(stdout);
+            answer = getchar();
+            while (answer != '\n' && getchar() != '\n') {
+                /* consume rest of line */
+            }
 
-        if (!(answer == 'y' || answer == 'Y')) {
-            fprintf(stderr, "Aborted: existing file was not replaced.\n");
-            free(raw_content);
-            fclose(disk_file);
-            return 1;
+            if (!(answer == 'y' || answer == 'Y')) {
+                fprintf(stderr, "Aborted: existing file was not replaced.\n");
+                free(raw_content);
+                fclose(disk_file);
+                return 1;
+            }
+        } else {
+            printf("File %.8s.%.3s exists. Auto-replacing due to -y.\n", flex_name, flex_ext);
         }
 
         if (reclaim_deleted_file_chain(disk_file, &existing_entry) != 0) {
