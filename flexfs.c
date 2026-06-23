@@ -698,12 +698,13 @@ static void usage(void)
     fprintf(stderr, "flexfs version %s\n", VERSION);
     fprintf(stderr, "-a: do space compressed to ASCII conversion.\n");
     fprintf(stderr, "-t: text translation (get: CR->LF + 0x09 space expansion, put: LF->CR + 0x09 space compression).\n");
+    fprintf(stderr, "-y: auto-delete existing target before put.\n");
     fprintf(stderr, "-d disk.dsk file.ext            : delete a file.\n");
     fprintf(stderr, "-g disk.dsk file.ext linuxfile  : get a file.\n");
     fprintf(stderr, "-g -A disk.dsk                  : extract all of the files.\n");
     fprintf(stderr, "-l disk.dsk                     : list contents of disk.\n");
     fprintf(stderr, "-m disk.dsk                     : check disk and show map.\n");
-    fprintf(stderr, "-p disk.disk file.ext linuxfile : put a file.\n");
+    fprintf(stderr, "-p disk.dsk linuxfile file.ext  : put a file.\n");
     fprintf(stderr, "-z <sector_size>                : sector size in bytes (128 or 256, defaults to 256).\n");
     exit(1);
 }
@@ -722,13 +723,14 @@ int main(int argc, char *argv[])
     int all = 0;
     int ascii = 0;
     int translate = 0;
+    int auto_yes = 0;
     enum command cmd = LIST;
     char *ext;
     char *name;
 
     assert(sizeof(struct dir) == 24);
     
-    while((opt = getopt(argc, argv, "lgmpdaAtz:")) != -1) {
+    while((opt = getopt(argc, argv, "lgmpdaAtyz:")) != -1) {
         switch(opt) {
         case 'l':
             cmd = LIST;
@@ -750,6 +752,9 @@ int main(int argc, char *argv[])
             break;
         case 't':
             translate = 1;
+            break;
+        case 'y':
+            auto_yes = 1;
             break;
         case 'A':
             all = 1;
@@ -780,7 +785,10 @@ int main(int argc, char *argv[])
             usage();
         else if (optind + 3 != argc)
             usage();
-        name = argv[optind + 1];
+        if (cmd == PUT)
+            name = argv[optind + 2];
+        else
+            name = argv[optind + 1];
         ext = strchr(name, '.');
         if (ext)
             *ext++ = 0;
@@ -819,14 +827,22 @@ int main(int argc, char *argv[])
             break;
         case PUT:
             {
-                FILE *fp = fopen(argv[optind + 2], "rb");
+                FILE *fp = fopen(argv[optind + 1], "rb");
                 if (fp == NULL) {
-                    perror(argv[optind + 2]);
+                    perror(argv[optind + 1]);
                     exit(1);
                 }
-                flex_addfile(name, ext, fp, translate);
+                if (auto_yes) {
+                    /* Ignore not-found: -y means delete if present. */
+                    (void)flex_unlink(name, ext);
+                }
+                if (flex_addfile(name, ext, fp, translate) < 0) {
+                    fprintf(stderr, "put failed: destination %s.%s already exists (use -y to replace) or no free directory slot.\n", name, ext);
+                    fclose(fp);
+                    exit(1);
+                }
                 if (fclose(fp) < 0) {
-                    perror(argv[optind + 2]);
+                    perror(argv[optind + 1]);
                     exit(1);
                 }
             }
