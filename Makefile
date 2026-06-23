@@ -1,12 +1,12 @@
 #all: binify flexfs
 
-all:	cmd2bin  fddump  fdedit  flexadd  flex-binify  flexdsk  flexdump  flexedit  flexfs  flexsort  flextract
+all:	cmd2bin  fddump  fdedit  flexadd  flex-binify  flexdsk  flexdump  flexedit  flexfs  flexsort  flextract  s192cmd
 
 CFLAGS += -Wall -pedantic
 
 clean:
 	rm -f *.o *~ binify flexfs md2bin fddump fdedit flexadd flex-binify flexdsk \
-	          flexdump flexedit flexfs flexsort flextract fddump.o fdedit.o     \
+	          flexdump flexedit flexfs flexsort flextract s192cmd fddump.o fdedit.o \
 	          flexdump.o flexedit.o
 
 
