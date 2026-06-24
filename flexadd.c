@@ -34,7 +34,7 @@
 #include <time.h>
 #include <math.h>
 
-#define VERSION "1.1.2"
+#define VERSION "1.1.3"
 
 // Sector size constants
 #define SECTOR_SIZE_128     128
@@ -54,6 +54,7 @@ uint8_t    start_tracks;
 uint8_t    start_sectors;
 
 uint8_t    end_track, end_sector;
+int        debug_mode = 0;
 
 // --- Utility Functions ---
 
@@ -180,12 +181,14 @@ int init_disk_info(FILE *disk_file) {
  */
 int find_free_sector(FILE *disk_file, uint8_t *track, uint8_t *sector) {
     SIR_struct *sir = (SIR_struct *)(SIR_buffer + SIR_OFFSET);
-    
-    int i = 0;
-    for( i = 0; i < SIR_SIZE; i++) {
-        fprintf(stderr, "%02x ", SIR_buffer[i+SIR_OFFSET]);
+
+    if (debug_mode) {
+        int i = 0;
+        for( i = 0; i < SIR_SIZE; i++) {
+            fprintf(stderr, "%02x ", SIR_buffer[i+SIR_OFFSET]);
+        }
+        fprintf(stderr, "\n");
     }
-    fprintf(stderr, "\n");
 
     *track  = sir->firstFreeTrack;
     *sector = sir->firstFreeSector;
@@ -268,12 +271,16 @@ int write_file_data(FILE *disk_file, const uint8_t *source_file_content, long co
             return -1;
         }
 
-    fprintf(stderr, "Current: T%d/S%d\n", current_track, current_sector);
+        if (debug_mode) {
+            fprintf(stderr, "Current: T%d/S%d\n", current_track, current_sector);
+        }
 
-    end_track  = current_track;
-    end_sector = current_sector;
+        end_track  = current_track;
+        end_sector = current_sector;
 
-    fprintf(stderr, "Current: T%d/S%d\n", end_track, end_sector);
+        if (debug_mode) {
+            fprintf(stderr, "Current: T%d/S%d\n", end_track, end_sector);
+        }
 
         if (*sector_count == 0) {
             *start_track  = current_track;
@@ -646,7 +653,9 @@ int write_directory_entry(FILE *disk_file, const DIR_struct *entry) {
                     free(sector_buffer);
                     return -1;
                 }
-                printf("Directory updated at T%d S%d, entry %d.\n", current_track, current_sector, i + 1);
+                if (debug_mode) {
+                    printf("Directory updated at T%d S%d, entry %d.\n", current_track, current_sector, i + 1);
+                }
                 free(sector_buffer);
                 return 0; // Success!
             }
@@ -722,7 +731,8 @@ int main(int argc, char *argv[]) {
     // Check for help or insufficient arguments
     if (argc < 4) {
         fprintf(stderr, "flexadd version %s\n", VERSION);
-        fprintf(stderr, "Usage: flexadd <disk_image_file> <host_file_path> <FLEX_FILENAME.EXT> [-t] [-y] [-z <sector_size>]\n");
+        fprintf(stderr, "Usage: flexadd <disk_image_file> <host_file_path> <FLEX_FILENAME.EXT> [-d] [-t] [-y] [-z <sector_size>]\n");
+        fprintf(stderr, "  -d: Enable debug output.\n");
         fprintf(stderr, "  -t: Enable text translation (LF->CR, space compression 0x09+count).\n");
         fprintf(stderr, "  -y: Auto-replace existing file without confirmation prompt.\n");
         fprintf(stderr, "  -z <sector_size>: Sector size in bytes (128 or 256, defaults to 256).\n");
@@ -734,12 +744,15 @@ int main(int argc, char *argv[]) {
     const char *host_path     = argv[2];
     const char *flex_name_ext = argv[3];
 
+    debug_mode = 0;
     int translate_mode = 0;
     int auto_yes = 0;
     
     // Parse optional arguments
     for (int i = 4; i < argc; i++) {
-        if (strcmp(argv[i], "-t") == 0) {
+        if (strcmp(argv[i], "-d") == 0) {
+            debug_mode = 1;
+        } else if (strcmp(argv[i], "-t") == 0) {
             translate_mode = 1;
         } else if (strcmp(argv[i], "-y") == 0) {
             auto_yes = 1;
@@ -868,7 +881,9 @@ int main(int argc, char *argv[]) {
     uint16_t total_sectors;
     
     // Write data to the file chain
-    printf("Writing %ld bytes (%s) to disk...\n", final_size, translate_mode ? "translated text" : "binary");
+    if (debug_mode) {
+        printf("Writing %ld bytes (%s) to disk...\n", final_size, translate_mode ? "translated text" : "binary");
+    }
 
     // We pass the final_size (which might be 0 for an empty file)
     if (write_file_data(disk_file, raw_content, final_size, translate_mode, &start_track, &start_sector, &total_sectors) != 0) {
@@ -907,10 +922,15 @@ int main(int argc, char *argv[]) {
     //end_track  = 0; 
     //end_sector = 0;
     
-    if (total_sectors > 0) {
-        printf("File data written: T%d S%d to T%d S%d, Total Sectors: %d\n", start_track, start_sector, end_track, end_sector, total_sectors);
-    } else {
-        printf("Empty file added (0 sectors).\n");
+    if (debug_mode) {
+        if (total_sectors > 0) {
+            printf("File data written: T%d S%d to T%d S%d, Total Sectors: %d\n", start_track, start_sector, end_track, end_sector, total_sectors);
+        } else {
+            printf("Empty file added (0 sectors).\n");
+        }
+    }
+
+    if (total_sectors == 0) {
         // For an empty file, the start/end T/S must be 0/0
         start_track = 0; start_sector = 0;
         end_track = 0; end_sector = 0;
@@ -948,19 +968,21 @@ int main(int argc, char *argv[]) {
     new_dir_entry.dateDay   = (uint8_t ) tm_info->tm_mday;
     new_dir_entry.dateYear  = (uint8_t )(tm_info->tm_year % 100);
 
-    fprintf(stderr, "%s.%s\n", new_dir_entry.fileName, new_dir_entry.fileExt);
-    fprintf(stderr, "Start: T%d/S%d\n", new_dir_entry.startTrack, new_dir_entry.startSector);
-    fprintf(stderr, "End:   T%d/S%d\n", new_dir_entry.endTrack, new_dir_entry.endSector);
-    fprintf(stderr, "Size:  %02x%02x (%d)\n\n", new_dir_entry.totalSectorsHi,
+        if (debug_mode) {
+        fprintf(stderr, "%s.%s\n", new_dir_entry.fileName, new_dir_entry.fileExt);
+        fprintf(stderr, "Start: T%d/S%d\n", new_dir_entry.startTrack, new_dir_entry.startSector);
+        fprintf(stderr, "End:   T%d/S%d\n", new_dir_entry.endTrack, new_dir_entry.endSector);
+        fprintf(stderr, "Size:  %02x%02x (%d)\n\n", new_dir_entry.totalSectorsHi,
             new_dir_entry.totalSectorsLo,
             ((new_dir_entry.totalSectorsHi << 8) + (new_dir_entry.totalSectorsLo)));
 
-    fprintf(stderr, "%2d/%2d/%2d\n", (tm_info->tm_mon + 1), tm_info->tm_mday,
+        fprintf(stderr, "%2d/%2d/%2d\n", (tm_info->tm_mon + 1), tm_info->tm_mday,
             (tm_info->tm_year % 100));
-    fprintf(stderr, "%2d/%2d/%2d (dec)\n", new_dir_entry.dateMonth, new_dir_entry.dateDay,
+        fprintf(stderr, "%2d/%2d/%2d (dec)\n", new_dir_entry.dateMonth, new_dir_entry.dateDay,
             new_dir_entry.dateYear);
-    fprintf(stderr, "%2x/%2x/%2x (hex)\n", new_dir_entry.dateMonth, new_dir_entry.dateDay,
+        fprintf(stderr, "%2x/%2x/%2x (hex)\n", new_dir_entry.dateMonth, new_dir_entry.dateDay,
             new_dir_entry.dateYear);
+        }
 
     // --- 7. Write Directory Entry ---
     if (write_directory_entry(disk_file, &new_dir_entry) != 0) {
