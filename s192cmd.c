@@ -6,9 +6,9 @@
 #include <errno.h>
 
 /*
- * s192cmd - Convert Motorola S-record (S19/S28/S37) files to FLEX CMD format.
+ * s192cmd - Convert Motorola S19 files to FLEX binary (.CMD) format.
  *
- * FLEX CMD record format:
+ * FLEX binary record format:
  *   0: 0x02 record marker
  *   1: load address high byte
  *   2: load address low byte
@@ -23,7 +23,9 @@
 
 static void usage(void)
 {
-    fprintf(stderr, "s192cmd [-x execaddr] srecfile output.cmd\n");
+    fprintf(stderr, "s192cmd [-x execaddr] [s19file [output.cmd]]\n");
+    fprintf(stderr, "  no file args : read S19 from stdin, write CMD to stdout\n");
+    fprintf(stderr, "  one file arg : read S19 from file,  write CMD to stdout\n");
     fprintf(stderr, "  -x execaddr : override execution address (decimal or 0xHEX)\n");
     exit(1);
 }
@@ -57,6 +59,22 @@ static int parse_u16(const char *s, uint16_t *out)
         return -1;
     *out = (uint16_t)v;
     return 0;
+}
+
+static int rstrip_line(char *line)
+{
+    size_t len = strlen(line);
+
+    while (len > 0) {
+        char c = line[len - 1];
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            line[--len] = '\0';
+            continue;
+        }
+        break;
+    }
+
+    return (int)len;
 }
 
 static int emit_flex_record(FILE *out, uint16_t addr, const uint8_t *data, uint16_t len)
@@ -96,6 +114,8 @@ int main(int argc, char *argv[])
     uint16_t exec = 0;
     FILE *in = NULL;
     FILE *out = NULL;
+    const char *in_name = "<stdin>";
+    const char *out_name = "<stdout>";
     char line[2048];
     int lineno = 0;
 
@@ -113,72 +133,75 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (optind + 2 != argc)
+    if (optind > argc || optind + 2 < argc)
         usage();
 
-    in = fopen(argv[optind], "r");
-    if (in == NULL) {
-        perror(argv[optind]);
-        return 1;
+    if (optind < argc) {
+        in_name = argv[optind];
+        in = fopen(in_name, "r");
+        if (in == NULL) {
+            perror(in_name);
+            return 1;
+        }
+    } else {
+        in = stdin;
     }
 
-    out = fopen(argv[optind + 1], "wb");
-    if (out == NULL) {
-        perror(argv[optind + 1]);
-        fclose(in);
-        return 1;
+    if (optind + 1 < argc) {
+        out_name = argv[optind + 1];
+        out = fopen(out_name, "wb");
+        if (out == NULL) {
+            perror(out_name);
+            if (in != stdin)
+                fclose(in);
+            return 1;
+        }
+    } else {
+        out = stdout;
     }
 
     while (fgets(line, sizeof(line), in) != NULL) {
-        uint8_t bytes[1024];
-        size_t linelen;
-        uint8_t count;
-        int addr_len;
-        uint32_t addr = 0;
-        int payload_len;
-        uint8_t sum = 0;
-        int nbytes;
+        uint8_t  bytes[255];
+        int      linelen;
+        uint8_t  count;
+        int      addr_len;
+        uint16_t addr = 0;
+        int      payload_len;
+        uint8_t  sum;
+        int      nbytes;
+        char     rtype;
 
         lineno++;
-        linelen = strlen(line);
-
-        while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
-            line[--linelen] = '\0';
-        }
+        linelen = rstrip_line(line);
 
         if (linelen == 0)
             continue;
 
-        if (line[0] != 'S' || linelen < 4)
-            continue;
+        if ((line[0] != 'S' && line[0] != 's') || linelen < 4) {
+            fprintf(stderr, "s192cmd: line %d is not a valid S-record line.\n", lineno);
+            goto fail;
+        }
 
-        switch (line[1]) {
+        rtype = line[1];
+        if (rtype >= 'a' && rtype <= 'z')
+            rtype = (char)(rtype - 'a' + 'A');
+
+        switch (rtype) {
         case '0':
             addr_len = 2;
             break;
         case '1':
             addr_len = 2;
             break;
-        case '2':
-            addr_len = 3;
-            break;
-        case '3':
-            addr_len = 4;
-            break;
         case '5':
             addr_len = 2;
-            break;
-        case '7':
-            addr_len = 4;
-            break;
-        case '8':
-            addr_len = 3;
             break;
         case '9':
             addr_len = 2;
             break;
         default:
-            continue;
+            fprintf(stderr, "s192cmd: line %d uses unsupported record type S%c (expect S19 input).\n", lineno, line[1]);
+            goto fail;
         }
 
         if (parse_hex_byte(line + 2, &count) < 0) {
@@ -187,11 +210,20 @@ int main(int argc, char *argv[])
         }
 
         nbytes = (int)count;
-        if (nbytes <= 0 || (size_t)(4 + (size_t)nbytes * 2) > linelen) {
+        if (nbytes <= 0 || nbytes > 255) {
+            fprintf(stderr, "s192cmd: line %d has invalid byte count.\n", lineno);
+            goto fail;
+        }
+        if (4 + nbytes * 2 != linelen) {
             fprintf(stderr, "s192cmd: line %d has invalid length/count.\n", lineno);
             goto fail;
         }
+        if (nbytes < addr_len + 1) {
+            fprintf(stderr, "s192cmd: line %d count too small for record type.\n", lineno);
+            goto fail;
+        }
 
+        sum = count;
         for (int i = 0; i < nbytes; i++) {
             if (parse_hex_byte(line + 4 + i * 2, &bytes[i]) < 0) {
                 fprintf(stderr, "s192cmd: line %d has invalid hex data.\n", lineno);
@@ -199,9 +231,8 @@ int main(int argc, char *argv[])
             }
             sum = (uint8_t)(sum + bytes[i]);
         }
-        sum = (uint8_t)(sum + count);
 
-        if (((uint8_t)~sum) != 0) {
+        if (sum != 0xFF) {
             fprintf(stderr, "s192cmd: line %d checksum mismatch.\n", lineno);
             goto fail;
         }
@@ -212,29 +243,21 @@ int main(int argc, char *argv[])
 
         payload_len = nbytes - addr_len - 1; /* Exclude checksum byte */
 
-        if (line[1] == '1' || line[1] == '2' || line[1] == '3') {
-            if (addr > 0xFFFFUL) {
-                fprintf(stderr, "s192cmd: line %d address 0x%08lX out of 16-bit range for FLEX CMD.\n", lineno, (unsigned long)addr);
-                goto fail;
-            }
+        if (rtype == '1') {
             if (payload_len > 0) {
                 if (emit_flex_record(out, (uint16_t)addr, bytes + addr_len, (uint16_t)payload_len) < 0) {
                     perror("s192cmd: write error");
                     goto fail;
                 }
             }
-        } else if (!setexec && (line[1] == '7' || line[1] == '8' || line[1] == '9')) {
-            if (addr > 0xFFFFUL) {
-                fprintf(stderr, "s192cmd: start address 0x%08lX out of 16-bit range for FLEX CMD.\n", (unsigned long)addr);
-                goto fail;
-            }
+        } else if (!setexec && rtype == '9') {
             exec = (uint16_t)addr;
             setexec = 1;
         }
     }
 
     if (ferror(in)) {
-        perror(argv[optind]);
+        perror(in_name);
         goto fail;
     }
 
@@ -247,18 +270,28 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (fclose(out) == EOF) {
-        perror(argv[optind + 1]);
-        fclose(in);
+    if (out != stdout) {
+        if (fclose(out) == EOF) {
+            perror(out_name);
+            if (in != stdin)
+                fclose(in);
+            return 1;
+        }
+    } else if (fflush(out) == EOF) {
+        perror(out_name);
+        if (in != stdin)
+            fclose(in);
         return 1;
     }
-    fclose(in);
+
+    if (in != stdin)
+        fclose(in);
     return 0;
 
 fail:
-    if (out)
+    if (out && out != stdout)
         fclose(out);
-    if (in)
+    if (in && in != stdin)
         fclose(in);
     return 1;
 }
