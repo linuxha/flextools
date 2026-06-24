@@ -564,7 +564,6 @@ static int flex_dump(struct dir *d, FILE *outf, int ascii, int translate)
 {
     int count = 0;
     int data_space = sector_size - 4;
-    int pending_space_count = 0;
     reset_decompress();
     /* Dump each sector in turn */
     if (d->strack == 0 && d->ssec == 0)
@@ -575,36 +574,9 @@ static int flex_dump(struct dir *d, FILE *outf, int ascii, int translate)
         if (((workbuf[2] << 8) | workbuf[3]) != count)
             fprintf(stderr, "%s.%s: sector %d has a sector count of %d.\n",
                 d->name, d->ext, count, (workbuf[2] << 8) | workbuf[3]);
-        if (ascii)
+        if (ascii || translate)
             decompress(workbuf + 4, data_space, outf);
-        else if (translate) {
-            for (int i = 0; i < data_space; i++) {
-                uint8_t c = workbuf[4 + i];
-
-                if (pending_space_count) {
-                    int count_spaces = c;
-                    while (count_spaces-- > 0) {
-                        if (fputc(' ', outf) == EOF) {
-                            fprintf(stderr, "%s.%s: write error.\n", d->name, d->ext);
-                            exit(1);
-                        }
-                    }
-                    pending_space_count = 0;
-                    continue;
-                }
-
-                if (c == 0x09) {
-                    pending_space_count = 1;
-                    continue;
-                }
-                if (c == 0x0D)
-                    c = 0x0A;
-                if (fputc(c, outf) == EOF) {
-                    fprintf(stderr, "%s.%s: write error.\n", d->name, d->ext);
-                    exit(1);
-                }
-            }
-        } else if (fwrite(workbuf + 4, data_space, 1, outf) != 1) {
+        else if (fwrite(workbuf + 4, data_space, 1, outf) != 1) {
             fprintf(stderr, "%s.%s: write error.\n", d->name, d->ext);
             exit(1);
         }

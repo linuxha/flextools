@@ -663,7 +663,8 @@ int write_directory_entry(FILE *disk_file, const DIR_struct *entry) {
 
 /**
  * @brief Translates Linux text file content to FLEX format.
- * Replaces LF ($0A) with CR ($0D), drops CR ($0D), and applies FLEX
+ * Replaces LF ($0A) with CR ($0D), drops CR ($0D), expands existing
+ * FLEX compressed-space pairs (0x09 + count), and writes canonical FLEX
  * space compression using 0x09 + count for space runs of length 2-127.
  * @param content_in Input buffer.
  * @param size_in Input size.
@@ -675,6 +676,17 @@ long translate_text_content(const uint8_t *content_in, long size_in, uint8_t *co
 
     for (long i = 0; i < size_in; i++) {
         uint8_t c = content_in[i];
+
+        if (c == 0x09 && (i + 1) < size_in) {
+            uint8_t run = content_in[++i];
+            if (run >= 2) {
+                content_out[size_out++] = 0x09;
+                content_out[size_out++] = run;
+            } else if (run == 1) {
+                content_out[size_out++] = ' ';
+            }
+            continue;
+        }
 
         if (c == '\r') {
             // Ignore Windows/Mac CR ($0D) if present in host file.
